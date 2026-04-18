@@ -175,51 +175,68 @@ def extract_sampled_frames(
     return outputs
 
 
-def _extract_luma_means_for_frames(video_path: str | Path, frames: list[int]) -> list[float]:
+def _extract_luma_mean_map_for_frames(
+    video_path: str | Path,
+    frames: list[int],
+    *,
+    max_select_frames: int = 600,
+) -> dict[int, float]:
+    """Read per-frame luma means for specific frame indices."""
     if not frames:
-        return []
-    unique_frames = sorted(set(frames))
-    select_parts = [f"eq(n\\,{frame})" for frame in unique_frames]
-    filter_expr = f"select='{'+'.join(select_parts)}',showinfo"
-    result = subprocess.run(
-        [
-            "ffmpeg",
-            "-hide_banner",
-            "-loglevel",
-            "info",
-            "-i",
-            str(video_path),
-            "-vf",
-            filter_expr,
-            "-an",
-            "-f",
-            "null",
-            "-",
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    output = f"{result.stdout}\n{result.stderr}"
-    means: list[float] = []
-    for line in output.splitlines():
-        if "showinfo" not in line:
-            continue
-        match = re.search(r"mean:\[([0-9 ]+)\]", line)
-        if not match:
-            continue
-        first_channel = match.group(1).split()[0]
-        means.append(float(first_channel))
-    return means
+        return {}
+
+    unique_frames = sorted({max(0, int(frame)) for frame in frames})
+    if not unique_frames:
+        return {}
+
+    mean_by_frame: dict[int, float] = {}
+    for start in range(0, len(unique_frames), max_select_frames):
+        chunk = unique_frames[start : start + max_select_frames]
+        select_parts = [f"eq(n\\,{frame})" for frame in chunk]
+        filter_expr = f"select='{'+'.join(select_parts)}',showinfo"
+        result = subprocess.run(
+            [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "info",
+                "-i",
+                str(video_path),
+                "-vf",
+                filter_expr,
+                "-an",
+                "-f",
+                "null",
+                "-",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        output = f"{result.stdout}\n{result.stderr}"
+        for line in output.splitlines():
+            if "showinfo" not in line:
+                continue
+            frame_match = re.search(r"n:\s*([0-9]+)", line)
+            mean_match = re.search(r"mean:\[([0-9 ]+)\]", line)
+            if not frame_match or not mean_match:
+                continue
+            first_channel = mean_match.group(1).split()[0]
+            mean_by_frame[int(frame_match.group(1))] = float(first_channel)
+    return mean_by_frame
 
 
 def local_frame_delta_score(video_path: str | Path, frame_index: int) -> float:
     """Estimate local frame delta around a boundary frame as [0, 1]."""
     previous_frame = max(0, frame_index - 1)
-    means = _extract_luma_means_for_frames(video_path, [previous_frame, frame_index])
-    if len(means) < 2:
+    mean_by_frame = _extract_luma_mean_map_for_frames(
+        video_path, [previous_frame, frame_index]
+    )
+    prev_mean = mean_by_frame.get(previous_frame)
+    curr_mean = mean_by_frame.get(frame_index)
+    if prev_mean is None or curr_mean is None:
         return 0.0
-    delta = abs(means[-1] - means[0]) / 255.0
+    delta = abs(curr_mean - prev_mean) / 255.0
     return max(0.0, min(1.0, delta))
 
 
@@ -227,4 +244,24 @@ def local_frame_delta_scores(
     video_path: str | Path, frame_indices: list[int]
 ) -> dict[int, float]:
     """Estimate local frame deltas for multiple frame indices."""
-    return {frame_idx: local_frame_delta_score(video_path, frame_idx) for frame_idx in frame_indices}
+    if not frame_indices:
+        return {}
+
+    target_frames = [max(0, int(frame_idx)) for frame_idx in frame_indices]
+    probe_frames: list[int] = []
+    for frame_idx in target_frames:
+        probe_frames.append(max(0, frame_idx - 1))
+        probe_frames.append(frame_idx)
+
+    mean_by_frame = _extract_luma_mean_map_for_frames(video_path, probe_frames)
+    scores: dict[int, float] = {}
+    for frame_idx in target_frames:
+        prev_frame = max(0, frame_idx - 1)
+        prev_mean = mean_by_frame.get(prev_frame)
+        curr_mean = mean_by_frame.get(frame_idx)
+        if prev_mean is None or curr_mean is None:
+            scores[frame_idx] = 0.0
+            continue
+        delta = abs(curr_mean - prev_mean) / 255.0
+        scores[frame_idx] = max(0.0, min(1.0, delta))
+    return scores

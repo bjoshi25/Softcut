@@ -376,17 +376,24 @@ def build_analysis_timeline(
         min_gap_frames=int(adapter_cfg["transnetv2"]["min_gap_frames"]),
     )
 
-    _emit(progress, "Computing local frame deltas and fusing detector boundaries.")
+    candidate_frame_indices = [
+        candidate.frame_index
+        for candidate in [*pyscene_boundaries, *transnet_boundaries]
+    ]
+    _emit(
+        progress,
+        (
+            "Computing local frame deltas and fusing detector boundaries "
+            f"({len(candidate_frame_indices)} candidates)."
+        ),
+    )
     fusion_config = BoundaryFusionConfig(
         cluster_tolerance_frames=int(fusion_cfg["cluster_tolerance_frames"]),
         nms_window_frames=int(fusion_cfg["nms_window_frames"]),
     )
     local_scores = ffmpeg_adapter.local_frame_delta_scores(
         source_path,
-        [
-            candidate.frame_index
-            for candidate in [*pyscene_boundaries, *transnet_boundaries]
-        ],
+        candidate_frame_indices,
     )
     canonical_boundaries = fuse_boundaries(
         transnet_boundaries=transnet_boundaries,
