@@ -73,6 +73,10 @@ def _download_detail(message: str) -> None:
     print(f"  [download] {message}", flush=True)
 
 
+def _speech_detail(message: str) -> None:
+    print(f"  [speech] {message}", flush=True)
+
+
 def _build_cli() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Run Softcut analysis from configs/project.yaml."
@@ -133,9 +137,11 @@ def main() -> None:
         ),
         progress=step_printer,
         download_progress=_download_detail,
+        speech_progress=_speech_detail,
     )
     step_printer("Analysis completed.")
     print(f"analysis_timeline: {output_path}")
+    print(f"analysis_quality_report: {output_path.parent / 'analysis_quality_report.json'}")
     print(f"duration_sec: {timeline.duration_sec}")
     print(f"fps: {timeline.fps}")
     print(f"scene_count: {len(timeline.scenes)}")

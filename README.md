@@ -123,12 +123,19 @@ printf '%s\n' 'https://www.youtube.com/watch?v=7cLTW934VR8' > data/inbox/url.txt
 - `analysis_run.source.mode`: `input` | `url` | `url_file`
 - `analysis_run.source.url_file`: path to your saved URL file (e.g. `data/inbox/url.txt`)
 - `analysis_run.job_id`: output job id
+- Optional speedup: set `adapters.whisperx.language` in `configs/analysis.yaml` (e.g. `"en"`) to skip language auto-detect.
 
 5) Run analysis:
 
 ```sh
 ./run analysis
 ```
+
+This now writes two artifacts:
+- `artifacts/<job_id>/analysis_timeline.json`
+- `artifacts/<job_id>/analysis_quality_report.json`
+
+For production-grade planning inputs, set `run_profile: strict` in `configs/analysis.yaml`.
 
 API:
 

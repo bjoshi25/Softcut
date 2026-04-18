@@ -21,7 +21,8 @@ resolve_python_bin() {
     return
   fi
 
-  for candidate in python3.14 python3.13 python3.12 python3.11 python3.10 python3; do
+  # Prefer ML-friendly versions first for torch/whisperx compatibility.
+  for candidate in python3.11 python3.10 python3.12 python3.13 python3.14 python3; do
     if ! command -v "$candidate" >/dev/null 2>&1; then
       continue
     fi
@@ -38,6 +39,15 @@ resolve_python_bin() {
 python_bin=$(resolve_python_bin)
 python_version=$("$python_bin" --version 2>&1 || true)
 printf '%s\n' "[ensure-python-env] Using $python_bin ($python_version)"
+
+if [ -d "$venv_dir" ]; then
+  selected_minor=$("$python_bin" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
+  venv_minor=$("$venv_dir/bin/python" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null || true)
+  if [ -n "$venv_minor" ] && [ "$selected_minor" != "$venv_minor" ]; then
+    printf '%s\n' "[ensure-python-env] Recreating $venv_dir (Python $venv_minor -> $selected_minor)"
+    rm -rf "$venv_dir"
+  fi
+fi
 
 if [ ! -d "$venv_dir" ]; then
   "$python_bin" -m venv "$venv_dir"

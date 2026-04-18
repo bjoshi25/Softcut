@@ -1,3 +1,5 @@
+run_profile: degraded
+
 fusion:
   cluster_tolerance_frames: 8
   nms_window_frames: 8
@@ -11,12 +13,39 @@ adapters:
     threshold: 0.50
     min_gap_frames: 4
   whisperx:
-    model_name: small
-    batch_size: 8
+    model_name: tiny
+    # Set to a known language (e.g. "en") to skip auto-detection and speed up ASR.
+    language: en
+    batch_size: 1
     diarize: false
+  openai_whisper:
+    enabled: true
+    model_name: base
+  ffmpeg_whisper:
+    enabled: false
+    # Path to a local whisper.cpp model file, e.g. models/ggml-base.en.bin
+    model_path: null
+    # Use "auto" or a fixed language like "en".
+    language: auto
+    queue: 10
+    use_gpu: true
+  subtitle_bootstrap:
+    enabled: false
+    language: en
+    min_segments_for_use: 10
   opennsfw2:
     threshold: 0.65
 
 sampling:
   sample_every_sec: 5.0
   max_visual_samples: 90
+
+quality:
+  min_evidence_per_minute: 0.4
+  extreme_cut_per_minute: 45.0
+  low_confidence_threshold: 0.2
+  strict_requires_transnet: true
+  strict_requires_visual: true
+
+runtime:
+  asr_timeout_sec: 900

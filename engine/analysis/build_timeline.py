@@ -4,14 +4,20 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
+import time
 from pathlib import Path
 from typing import Any, Callable
 
 from engine.adapters import (
+    ffmpeg_whisper_adapter,
     ffmpeg_adapter,
+    openai_whisper_adapter,
     opennsfw2_adapter,
     pyscenedetect_adapter,
+    subtitle_adapter,
     transnetv2_adapter,
+    visual_secondary_adapter,
     whisperx_adapter,
     yt_dlp_adapter,
 )
@@ -23,8 +29,12 @@ from engine.schemas.timeline import (
     AdapterState,
     AdapterStatus,
     AnalysisMetadata,
+    AnalysisQualityReport,
     AnalysisTimeline,
+    ContinuityFeature,
+    EditContextWindow,
     RatingEvidence,
+    SafeCutPoint,
     SceneBoundary,
     SceneSegment,
     SpeechSegment,
@@ -42,7 +52,36 @@ PROFANITY_TERMS = {
     "cunt",
 }
 
+LANGUAGE_INTENSITY_MAP = {
+    "fuck": 0.92,
+    "fucking": 0.92,
+    "motherfucker": 0.95,
+    "shit": 0.78,
+    "bullshit": 0.76,
+    "bitch": 0.72,
+    "asshole": 0.82,
+    "dick": 0.66,
+    "damn": 0.45,
+    "hell": 0.40,
+}
+
+SUGGESTIVE_PHRASES = {
+    "make out": 0.55,
+    "hook up": 0.58,
+    "sex": 0.72,
+    "nude": 0.75,
+}
+
+VIOLENCE_PHRASES = {
+    "kill": 0.62,
+    "murder": 0.74,
+    "shoot": 0.58,
+    "blood": 0.52,
+    "explode": 0.56,
+}
+
 DEFAULT_ANALYSIS_CONFIG: dict[str, Any] = {
+    "run_profile": "degraded",
     "fusion": {
         "cluster_tolerance_frames": 8,
         "nms_window_frames": 8,
@@ -59,16 +98,43 @@ DEFAULT_ANALYSIS_CONFIG: dict[str, Any] = {
         },
         "whisperx": {
             "model_name": "small",
+            "language": None,
             "batch_size": 8,
             "diarize": False,
         },
+        "openai_whisper": {
+            "enabled": True,
+            "model_name": "base",
+        },
+        "ffmpeg_whisper": {
+            "enabled": False,
+            "model_path": None,
+            "language": "auto",
+            "queue": 10,
+            "use_gpu": True,
+        },
         "opennsfw2": {
             "threshold": 0.65,
+        },
+        "subtitle_bootstrap": {
+            "enabled": False,
+            "language": "en",
+            "min_segments_for_use": 10,
         },
     },
     "sampling": {
         "sample_every_sec": 5.0,
         "max_visual_samples": 90,
+    },
+    "quality": {
+        "min_evidence_per_minute": 0.4,
+        "extreme_cut_per_minute": 45.0,
+        "low_confidence_threshold": 0.2,
+        "strict_requires_transnet": True,
+        "strict_requires_visual": True,
+    },
+    "runtime": {
+        "asr_timeout_sec": 900,
     },
 }
 
@@ -234,16 +300,19 @@ def _build_rating_evidence(
     index = 0
 
     for word in word_segments:
-        token = word.word.strip().lower().strip(".,!?\"'()[]{}")
-        if token in PROFANITY_TERMS:
+        token = _normalize_text_token(word.word)
+        base_score = LANGUAGE_INTENSITY_MAP.get(token)
+        if base_score is not None or token in PROFANITY_TERMS:
+            score = max(base_score or 0.70, 0.70)
+            evidence_type = "strong_profanity" if score >= 0.80 else "moderate_profanity"
             evidence.append(
                 RatingEvidence(
                     evidence_id=f"evidence_{index:04d}",
                     start_sec=word.start_sec,
                     end_sec=word.end_sec,
                     dimension="language",
-                    evidence_type="strong_profanity",
-                    score=0.85,
+                    evidence_type=evidence_type,
+                    score=min(0.98, score),
                     references={"word_id": word.word_id},
                 )
             )
@@ -251,19 +320,36 @@ def _build_rating_evidence(
 
     for speech in speech_segments:
         text = speech.text.lower()
-        if "kill" in text or "murder" in text:
-            evidence.append(
-                RatingEvidence(
-                    evidence_id=f"evidence_{index:04d}",
-                    start_sec=speech.start_sec,
-                    end_sec=speech.end_sec,
-                    dimension="violence",
-                    evidence_type="violent_dialogue",
-                    score=0.60,
-                    references={"segment_id": speech.segment_id},
+        for phrase, score in VIOLENCE_PHRASES.items():
+            if phrase in text:
+                evidence.append(
+                    RatingEvidence(
+                        evidence_id=f"evidence_{index:04d}",
+                        start_sec=speech.start_sec,
+                        end_sec=speech.end_sec,
+                        dimension="violence",
+                        evidence_type="violent_dialogue",
+                        score=score,
+                        references={"segment_id": speech.segment_id, "phrase": phrase},
+                    )
                 )
-            )
-            index += 1
+                index += 1
+                break
+        for phrase, score in SUGGESTIVE_PHRASES.items():
+            if phrase in text:
+                evidence.append(
+                    RatingEvidence(
+                        evidence_id=f"evidence_{index:04d}",
+                        start_sec=speech.start_sec,
+                        end_sec=speech.end_sec,
+                        dimension="suggestive_dialogue",
+                        evidence_type="suggestive_dialogue",
+                        score=score,
+                        references={"segment_id": speech.segment_id, "phrase": phrase},
+                    )
+                )
+                index += 1
+                break
 
     for flag in visual_flags:
         evidence.append(
@@ -285,6 +371,229 @@ def _adapter_available_status() -> AdapterStatus:
     return AdapterStatus(state=AdapterState.available)
 
 
+def _normalize_text_token(value: str) -> str:
+    cleaned = value.strip().lower().strip(".,!?\"'()[]{}")
+    if cleaned.endswith("ing") and len(cleaned) > 5:
+        return cleaned[:-3]
+    if cleaned.endswith("ed") and len(cleaned) > 4:
+        return cleaned[:-2]
+    return cleaned
+
+
+def _calibrate_pyscene_scores(
+    *,
+    pyscene_boundaries: list,
+    transnet_boundaries: list,
+    local_scores: dict[int, float],
+    tolerance_frames: int,
+) -> None:
+    transnet_frames = [boundary.frame_index for boundary in transnet_boundaries]
+    for candidate in pyscene_boundaries:
+        local = local_scores.get(candidate.frame_index, 0.0)
+        agreement = 1.0 if any(
+            abs(candidate.frame_index - frame) <= tolerance_frames
+            for frame in transnet_frames
+        ) else 0.0
+        calibrated = 0.35 + 0.40 * local + 0.25 * agreement
+        candidate.score = max(0.15, min(0.98, calibrated))
+
+
+def _score_entropy(values: list[float]) -> float:
+    if not values:
+        return 0.0
+    bins = [0, 0, 0, 0, 0]
+    for value in values:
+        index = min(4, max(0, int(value * 5)))
+        bins[index] += 1
+    total = float(sum(bins))
+    entropy = 0.0
+    for count in bins:
+        if count <= 0:
+            continue
+        p = count / total
+        entropy += -p * math.log2(p)
+    return entropy / math.log2(5.0)
+
+
+def _speech_density_between(
+    speech_segments: list[SpeechSegment], start_sec: float, end_sec: float
+) -> float:
+    window = max(0.01, end_sec - start_sec)
+    spoken = 0.0
+    for segment in speech_segments:
+        overlap_start = max(start_sec, segment.start_sec)
+        overlap_end = min(end_sec, segment.end_sec)
+        if overlap_end > overlap_start:
+            spoken += overlap_end - overlap_start
+    return max(0.0, min(1.0, spoken / window))
+
+
+def _nearest_boundary(
+    sec: float, boundaries: list[SceneBoundary]
+) -> tuple[SceneBoundary | None, float]:
+    if not boundaries:
+        return None, 9999.0
+    nearest = min(boundaries, key=lambda boundary: abs(boundary.sec - sec))
+    return nearest, abs(nearest.sec - sec)
+
+
+def _build_edit_ready_features(
+    *,
+    fps: float,
+    duration_sec: float,
+    rating_evidence: list[RatingEvidence],
+    boundaries: list[SceneBoundary],
+    local_scores: dict[int, float],
+    speech_segments: list[SpeechSegment],
+) -> tuple[list[SafeCutPoint], list[EditContextWindow], list[ContinuityFeature]]:
+    safe_cut_points: list[SafeCutPoint] = []
+    edit_windows: list[EditContextWindow] = []
+    continuity_features: list[ContinuityFeature] = []
+
+    for index, evidence in enumerate(rating_evidence):
+        anchor_start = max(0.0, evidence.start_sec - 0.30)
+        anchor_end = min(duration_sec, evidence.end_sec + 0.30)
+        for kind, anchor_sec in (("pre", anchor_start), ("post", anchor_end)):
+            frame_index = max(0, int(round(anchor_sec * fps)))
+            local = local_scores.get(frame_index, 0.0)
+            nearest_boundary, proximity = _nearest_boundary(anchor_sec, boundaries)
+            boundary_conf = nearest_boundary.fused_score if nearest_boundary else 0.0
+            speech_density = _speech_density_between(
+                speech_segments,
+                max(0.0, anchor_sec - 0.5),
+                min(duration_sec, anchor_sec + 0.5),
+            )
+            safe_cut_points.append(
+                SafeCutPoint(
+                    point_id=f"cut_{index:04d}_{kind}",
+                    sec=round(anchor_sec, 6),
+                    frame_index=frame_index,
+                    kind=kind,
+                    motion_score=round(local, 6),
+                    speech_density=round(speech_density, 6),
+                    boundary_confidence=round(boundary_conf, 6),
+                    references={"evidence_id": evidence.evidence_id},
+                )
+            )
+            continuity_features.append(
+                ContinuityFeature(
+                    feature_id=f"continuity_{index:04d}_{kind}",
+                    start_sec=max(0.0, anchor_sec - 0.25),
+                    end_sec=min(duration_sec, anchor_sec + 0.25),
+                    motion_score=round(local, 6),
+                    speech_density=round(speech_density, 6),
+                    scene_proximity_sec=round(proximity, 6),
+                    boundary_confidence=round(boundary_conf, 6),
+                    references={"evidence_id": evidence.evidence_id},
+                )
+            )
+        edit_windows.append(
+            EditContextWindow(
+                window_id=f"window_{index:04d}",
+                evidence_id=evidence.evidence_id,
+                start_sec=max(0.0, evidence.start_sec - 0.40),
+                end_sec=min(duration_sec, evidence.end_sec + 0.40),
+                pre_pad_sec=0.40,
+                post_pad_sec=0.40,
+                overlap_tag="compatible",
+                compatible_actions=[
+                    "mute_word",
+                    "beep_word",
+                    "trim_segment",
+                    "remove_scene",
+                ],
+            )
+        )
+    return safe_cut_points, edit_windows, continuity_features
+
+
+def _determine_asr_mode(
+    *,
+    speech_segments: list[SpeechSegment],
+    whisperx_status: AdapterStatus,
+    ffmpeg_whisper_status: AdapterStatus,
+    openai_whisper_status: AdapterStatus,
+) -> str:
+    if speech_segments and (
+        whisperx_status.state == AdapterState.available
+        or ffmpeg_whisper_status.state == AdapterState.available
+        or openai_whisper_status.state == AdapterState.available
+    ):
+        return "full"
+    if speech_segments:
+        return "degraded"
+    return "failed"
+
+
+def _determine_visual_mode(opennsfw_status: AdapterStatus) -> str:
+    return "full" if opennsfw_status.state == AdapterState.available else "disabled"
+
+
+def _build_quality_report(
+    *,
+    job_id: str,
+    run_profile: str,
+    duration_sec: float,
+    rating_evidence: list[RatingEvidence],
+    boundary_models: list[SceneBoundary],
+    local_scores: dict[int, float],
+    asr_mode: str,
+    visual_mode: str,
+    transnet_status: AdapterStatus,
+    quality_cfg: dict[str, Any],
+) -> AnalysisQualityReport:
+    warnings: list[str] = []
+    critical_findings: list[str] = []
+    next_actions: list[str] = []
+
+    local_all_zero = bool(local_scores) and all(score == 0.0 for score in local_scores.values())
+    if local_all_zero:
+        critical_findings.append("local_frame_delta_all_zero")
+        next_actions.append("Fix ffmpeg showinfo mapping and verify non-zero local deltas.")
+
+    single_detector_only = transnet_status.state != AdapterState.available
+    if single_detector_only:
+        warnings.append("single_detector_only")
+        next_actions.append("Install/enable TransNetV2 for multi-detector fusion confidence.")
+
+    cut_density = (len(boundary_models) / max(1.0, duration_sec / 60.0))
+    if cut_density >= float(quality_cfg["extreme_cut_per_minute"]):
+        warnings.append(f"extreme_cut_density={cut_density:.2f}/min")
+
+    evidence_per_min = len(rating_evidence) / max(1.0, duration_sec / 60.0)
+    if evidence_per_min < float(quality_cfg["min_evidence_per_minute"]):
+        warnings.append(f"low_evidence_density={evidence_per_min:.2f}/min")
+        next_actions.append("Increase evidence recall (lexicon/phrases/subtitles/visual adapters).")
+
+    if asr_mode == "failed":
+        critical_findings.append("asr_failed")
+    elif asr_mode == "degraded":
+        warnings.append("asr_degraded")
+
+    if visual_mode != "full":
+        warnings.append("visual_disabled")
+
+    planner_eligible = asr_mode != "failed" and (
+        visual_mode == "full" or run_profile != "strict"
+    )
+    if run_profile == "strict":
+        if bool(quality_cfg.get("strict_requires_transnet", True)) and single_detector_only:
+            critical_findings.append("strict_requires_transnet")
+        if bool(quality_cfg.get("strict_requires_visual", True)) and visual_mode != "full":
+            critical_findings.append("strict_requires_visual")
+        planner_eligible = planner_eligible and not critical_findings
+
+    passed = planner_eligible and not critical_findings
+    return AnalysisQualityReport(
+        job_id=job_id,
+        run_profile=run_profile,
+        passed=passed,
+        critical_findings=critical_findings,
+        warnings=warnings,
+        next_actions=next_actions,
+        planner_eligible=planner_eligible,
+    )
+
 def build_analysis_timeline(
     *,
     input_video_path: str | None = None,
@@ -299,6 +608,7 @@ def build_analysis_timeline(
     config_path: str = "configs/analysis.yaml",
     progress: ProgressCallback | None = None,
     download_progress: ProgressCallback | None = None,
+    speech_progress: ProgressCallback | None = None,
 ) -> tuple[AnalysisTimeline, Path]:
     if (input_video_path is None and source_url is None) or (
         input_video_path is not None and source_url is not None
@@ -307,14 +617,17 @@ def build_analysis_timeline(
 
     ingest_status: AdapterStatus
     source_notes: list[str] = []
+    step_timings: dict[str, float] = {}
     if source_url is not None:
         _emit(progress, "Downloading source video from URL.")
+        stage_start = time.monotonic()
         source_path, ingest_status = yt_dlp_adapter.download_video_from_url(
             source_url=source_url,
             output_dir=download_dir,
             job_id=job_id,
             progress=download_progress,
         )
+        step_timings["download_source_sec"] = round(time.monotonic() - stage_start, 4)
         source_notes.append(f"source_url={source_url}")
     else:
         source_path = Path(str(input_video_path))
@@ -328,9 +641,14 @@ def build_analysis_timeline(
 
     _emit(progress, "Loading analysis config.")
     analysis_config, config_notes = _load_analysis_config(config_path)
+    run_profile = str(analysis_config.get("run_profile") or "degraded").strip().lower()
+    if run_profile not in {"strict", "degraded"}:
+        run_profile = "degraded"
     fusion_cfg = analysis_config["fusion"]
     adapter_cfg = analysis_config["adapters"]
     sampling_cfg = analysis_config["sampling"]
+    quality_cfg = analysis_config["quality"]
+    runtime_cfg = analysis_config["runtime"]
 
     resolved_sample_every_sec = (
         sample_every_sec
@@ -348,8 +666,21 @@ def build_analysis_timeline(
         else bool(adapter_cfg["whisperx"].get("diarize", False))
     )
 
+    _emit(progress, "Running preflight capability checks.")
+    ffmpeg_whisper_cfg = adapter_cfg.get("ffmpeg_whisper", {})
+    subtitle_cfg = adapter_cfg.get("subtitle_bootstrap", {})
+    preflight_capabilities = {
+        "run_profile": run_profile,
+        "ffmpeg_whisper_enabled": bool(ffmpeg_whisper_cfg.get("enabled", False)),
+        "subtitle_bootstrap_enabled": bool(subtitle_cfg.get("enabled", False)),
+        "strict_mode": run_profile == "strict",
+        "expected_risks": [],
+    }
+
     _emit(progress, "Probing source video metadata.")
+    stage_start = time.monotonic()
     video_metadata = ffmpeg_adapter.probe_video(source_path)
+    step_timings["probe_video_sec"] = round(time.monotonic() - stage_start, 4)
     ffmpeg_status = _adapter_available_status().model_copy(
         update={
             "version": ffmpeg_adapter.ffmpeg_version(),
@@ -360,6 +691,7 @@ def build_analysis_timeline(
     )
 
     _emit(progress, "Running scene boundary detector (PySceneDetect/fallback).")
+    stage_start = time.monotonic()
     pyscene_boundaries, pyscene_status = pyscenedetect_adapter.detect_boundaries(
         source_path,
         fps=video_metadata.fps,
@@ -369,12 +701,15 @@ def build_analysis_timeline(
             adapter_cfg["pyscenedetect"]["ffmpeg_scene_threshold"]
         ),
     )
+    step_timings["detect_pyscene_sec"] = round(time.monotonic() - stage_start, 4)
     _emit(progress, "Running shot boundary detector (TransNetV2 when available).")
+    stage_start = time.monotonic()
     transnet_boundaries, transnet_status = transnetv2_adapter.detect_boundaries(
         source_path,
         threshold=float(adapter_cfg["transnetv2"]["threshold"]),
         min_gap_frames=int(adapter_cfg["transnetv2"]["min_gap_frames"]),
     )
+    step_timings["detect_transnet_sec"] = round(time.monotonic() - stage_start, 4)
 
     candidate_frame_indices = [
         candidate.frame_index
@@ -391,10 +726,19 @@ def build_analysis_timeline(
         cluster_tolerance_frames=int(fusion_cfg["cluster_tolerance_frames"]),
         nms_window_frames=int(fusion_cfg["nms_window_frames"]),
     )
+    stage_start = time.monotonic()
     local_scores = ffmpeg_adapter.local_frame_delta_scores(
         source_path,
         candidate_frame_indices,
+        fps=video_metadata.fps,
     )
+    _calibrate_pyscene_scores(
+        pyscene_boundaries=pyscene_boundaries,
+        transnet_boundaries=transnet_boundaries,
+        local_scores=local_scores,
+        tolerance_frames=fusion_config.cluster_tolerance_frames,
+    )
+    step_timings["compute_local_delta_sec"] = round(time.monotonic() - stage_start, 4)
     canonical_boundaries = fuse_boundaries(
         transnet_boundaries=transnet_boundaries,
         pyscene_boundaries=pyscene_boundaries,
@@ -420,20 +764,125 @@ def build_analysis_timeline(
     )
 
     _emit(progress, "Building canonical scene timeline.")
+    stage_start = time.monotonic()
     scenes = _build_scenes(
         boundaries=boundary_models,
         fps=video_metadata.fps,
         duration_sec=video_metadata.duration_sec,
         total_frames=video_metadata.total_frames,
     )
+    step_timings["build_scenes_sec"] = round(time.monotonic() - stage_start, 4)
 
-    _emit(progress, "Running speech analysis (WhisperX when available).")
-    speech_segments, word_segments, whisperx_status = whisperx_adapter.transcribe(
-        source_path,
-        model_name=str(adapter_cfg["whisperx"]["model_name"]),
-        batch_size=int(adapter_cfg["whisperx"]["batch_size"]),
-        diarize=resolved_diarize,
+    _emit(progress, "Running speech analysis (ffmpeg whisper/WhisperX fallback).")
+    stage_start = time.monotonic()
+    configured_whisperx_language = adapter_cfg["whisperx"].get("language")
+    resolved_whisperx_language = (
+        str(configured_whisperx_language).strip()
+        if configured_whisperx_language is not None
+        else None
     )
+    if resolved_whisperx_language == "":
+        resolved_whisperx_language = None
+
+    ffmpeg_whisper_cfg = adapter_cfg.get("ffmpeg_whisper", {})
+    ffmpeg_whisper_enabled = bool(ffmpeg_whisper_cfg.get("enabled", False))
+    ffmpeg_whisper_language = ffmpeg_whisper_cfg.get("language")
+    if ffmpeg_whisper_language is None:
+        ffmpeg_whisper_language = "auto"
+    ffmpeg_whisper_language = str(ffmpeg_whisper_language).strip()
+    if ffmpeg_whisper_language == "":
+        ffmpeg_whisper_language = "auto"
+
+    speech_segments: list[SpeechSegment] = []
+    word_segments: list[WordSegment] = []
+    openai_whisper_cfg = adapter_cfg.get("openai_whisper", {})
+    openai_whisper_status = AdapterStatus(
+        state=AdapterState.fallback,
+        detail="Not used.",
+        config=openai_whisper_cfg,
+    )
+    subtitle_status = AdapterStatus(
+        state=AdapterState.fallback,
+        detail="Subtitle bootstrap disabled.",
+        config=subtitle_cfg,
+    )
+    if ffmpeg_whisper_enabled:
+        _emit(progress, "Trying ffmpeg whisper filter.")
+        ffmpeg_speech, ffmpeg_words, ffmpeg_whisper_status = (
+            ffmpeg_whisper_adapter.transcribe(
+                source_path,
+                model_path=ffmpeg_whisper_cfg.get("model_path"),
+                language=None
+                if ffmpeg_whisper_language == "auto"
+                else ffmpeg_whisper_language,
+                queue=int(ffmpeg_whisper_cfg.get("queue", 10)),
+                use_gpu=bool(ffmpeg_whisper_cfg.get("use_gpu", True)),
+            )
+        )
+        if ffmpeg_whisper_status.state == AdapterState.available and ffmpeg_speech:
+            speech_segments = ffmpeg_speech
+            word_segments = ffmpeg_words
+            whisperx_status = AdapterStatus(
+                state=AdapterState.fallback,
+                detail="Skipped because ffmpeg whisper succeeded.",
+                config=adapter_cfg["whisperx"],
+            )
+        else:
+            _emit(progress, "ffmpeg whisper unavailable/failed; falling back to WhisperX.")
+            speech_segments, word_segments, whisperx_status = whisperx_adapter.transcribe(
+                source_path,
+                model_name=str(adapter_cfg["whisperx"]["model_name"]),
+                language=resolved_whisperx_language,
+                batch_size=int(adapter_cfg["whisperx"]["batch_size"]),
+                diarize=resolved_diarize,
+                timeout_sec=int(runtime_cfg.get("asr_timeout_sec", 900)),
+                progress=speech_progress,
+            )
+    else:
+        ffmpeg_whisper_status = AdapterStatus(
+            state=AdapterState.fallback,
+            detail="Disabled by config; using WhisperX.",
+            config=ffmpeg_whisper_cfg,
+        )
+        speech_segments, word_segments, whisperx_status = whisperx_adapter.transcribe(
+            source_path,
+            model_name=str(adapter_cfg["whisperx"]["model_name"]),
+            language=resolved_whisperx_language,
+            batch_size=int(adapter_cfg["whisperx"]["batch_size"]),
+            diarize=resolved_diarize,
+            timeout_sec=int(runtime_cfg.get("asr_timeout_sec", 900)),
+            progress=speech_progress,
+        )
+
+    if not speech_segments and bool(openai_whisper_cfg.get("enabled", True)):
+        _emit(progress, "WhisperX empty/unavailable; falling back to openai-whisper.")
+        speech_segments, word_segments, openai_whisper_status = openai_whisper_adapter.transcribe(
+            source_path,
+            model_name=str(openai_whisper_cfg.get("model_name") or "base"),
+            language=resolved_whisperx_language,
+        )
+
+    if not speech_segments and bool(subtitle_cfg.get("enabled", False)):
+        _emit(progress, "ASR empty; trying subtitle bootstrap (supplemental).")
+        subtitle_segments, subtitle_status = subtitle_adapter.fetch_subtitle_segments(
+            source_url=source_url,
+            output_dir=download_dir,
+            job_id=job_id,
+            language=str(subtitle_cfg.get("language") or "en"),
+        )
+        min_required = int(subtitle_cfg.get("min_segments_for_use", 10))
+        if len(subtitle_segments) >= min_required:
+            speech_segments = subtitle_segments
+            word_segments = []
+            if whisperx_status.state == AdapterState.unavailable:
+                whisperx_status = whisperx_status.model_copy(
+                    update={
+                        "state": AdapterState.fallback,
+                        "detail": "WhisperX unavailable; using subtitle bootstrap.",
+                    }
+                )
+    step_timings["speech_analysis_sec"] = round(time.monotonic() - stage_start, 4)
+
     speech_segments = _sanitize_speech_segments(
         speech_segments, duration_sec=video_metadata.duration_sec
     )
@@ -442,6 +891,7 @@ def build_analysis_timeline(
     )
 
     _emit(progress, "Sampling frames for visual analysis.")
+    stage_start = time.monotonic()
     work_dir = Path(work_root) / job_id / "frames"
     sampled_frames = ffmpeg_adapter.extract_sampled_frames(
         source_path,
@@ -450,18 +900,99 @@ def build_analysis_timeline(
         sample_every_sec=resolved_sample_every_sec,
         max_samples=resolved_max_visual_samples,
     )
+    step_timings["sample_frames_sec"] = round(time.monotonic() - stage_start, 4)
     _emit(progress, "Running visual NSFW scoring (OpenNSFW2 when available).")
+    stage_start = time.monotonic()
     visual_flags, opennsfw_status = opennsfw2_adapter.score_sampled_frames(
         sampled_frames,
         fps=video_metadata.fps,
         threshold=float(adapter_cfg["opennsfw2"]["threshold"]),
     )
+    secondary_visual_flags, secondary_visual_status = (
+        visual_secondary_adapter.score_sampled_frames(
+            sampled_frames,
+            fps=video_metadata.fps,
+        )
+    )
+    visual_flags = [*visual_flags, *secondary_visual_flags]
+    step_timings["visual_scoring_sec"] = round(time.monotonic() - stage_start, 4)
 
     _emit(progress, "Building rating evidence and writing artifact.")
+    stage_start = time.monotonic()
     rating_evidence = _build_rating_evidence(
         speech_segments=speech_segments,
         word_segments=word_segments,
         visual_flags=visual_flags,
+    )
+    safe_cut_points, edit_context_windows, continuity_features = _build_edit_ready_features(
+        fps=video_metadata.fps,
+        duration_sec=video_metadata.duration_sec,
+        rating_evidence=rating_evidence,
+        boundaries=boundary_models,
+        local_scores=local_scores,
+        speech_segments=speech_segments,
+    )
+    step_timings["build_evidence_sec"] = round(time.monotonic() - stage_start, 4)
+
+    asr_mode = _determine_asr_mode(
+        speech_segments=speech_segments,
+        whisperx_status=whisperx_status,
+        ffmpeg_whisper_status=ffmpeg_whisper_status,
+        openai_whisper_status=openai_whisper_status,
+    )
+    visual_mode = _determine_visual_mode(opennsfw_status)
+    detector_coverage = (
+        sum(
+            1
+            for status in [pyscene_status, transnet_status]
+            if status.state == AdapterState.available
+        )
+        / 2.0
+    )
+    fused_scores = [boundary.fused_score for boundary in boundary_models]
+    low_conf_threshold = float(quality_cfg.get("low_confidence_threshold", 0.2))
+    low_conf_ratio = (
+        sum(1 for score in fused_scores if score < low_conf_threshold) / max(1, len(fused_scores))
+    )
+    boundary_quality = {
+        "detector_coverage": round(detector_coverage, 6),
+        "score_entropy": round(_score_entropy(fused_scores), 6),
+        "low_confidence_ratio": round(low_conf_ratio, 6),
+        "local_delta_all_zero": bool(local_scores) and all(
+            score == 0.0 for score in local_scores.values()
+        ),
+        "cut_density_per_min": round(
+            len(boundary_models) / max(1.0, video_metadata.duration_sec / 60.0), 6
+        ),
+    }
+    quality_flags: list[str] = []
+    if boundary_quality["local_delta_all_zero"]:
+        quality_flags.append("local_delta_all_zero")
+    if detector_coverage < 1.0:
+        quality_flags.append("single_detector_only")
+    if visual_mode != "full":
+        quality_flags.append("visual_mode_disabled")
+    if asr_mode != "full":
+        quality_flags.append(f"asr_mode_{asr_mode}")
+
+    if detector_coverage < 1.0:
+        preflight_capabilities["expected_risks"].append("single_detector_fusion")
+    if visual_mode != "full":
+        preflight_capabilities["expected_risks"].append("visual_under_instrumented")
+    if asr_mode != "full":
+        preflight_capabilities["expected_risks"].append("asr_under_instrumented")
+
+    quality_report = _build_quality_report(
+        job_id=job_id,
+        run_profile=run_profile,
+        duration_sec=video_metadata.duration_sec,
+        rating_evidence=rating_evidence,
+        boundary_models=boundary_models,
+        local_scores=local_scores,
+        asr_mode=asr_mode,
+        visual_mode=visual_mode,
+        transnet_status=transnet_status,
+        quality_cfg=quality_cfg,
     )
 
     metadata = AnalysisMetadata(
@@ -475,8 +1006,12 @@ def build_analysis_timeline(
             },
             "pyscenedetect": pyscene_status.config,
             "transnetv2": transnet_status.config,
+            "ffmpeg_whisper": ffmpeg_whisper_status.config,
             "whisperx": whisperx_status.config,
+            "openai_whisper": openai_whisper_status.config,
+            "subtitle_bootstrap": subtitle_status.config,
             "opennsfw2": opennsfw_status.config,
+            "visual_secondary": secondary_visual_status.config,
             "sampling": {
                 "sample_every_sec": resolved_sample_every_sec,
                 "max_visual_samples": resolved_max_visual_samples,
@@ -488,8 +1023,12 @@ def build_analysis_timeline(
             "ffmpeg": ffmpeg_status,
             "pyscenedetect": pyscene_status,
             "transnetv2": transnet_status,
+            "ffmpeg_whisper": ffmpeg_whisper_status,
             "whisperx": whisperx_status,
+            "openai_whisper": openai_whisper_status,
+            "subtitle_bootstrap": subtitle_status,
             "opennsfw2": opennsfw_status,
+            "visual_secondary": secondary_visual_status,
         },
         fusion={
             "candidate_count": len(pyscene_boundaries) + len(transnet_boundaries),
@@ -497,6 +1036,13 @@ def build_analysis_timeline(
             "cluster_tolerance_frames": fusion_config.cluster_tolerance_frames,
             "nms_window_frames": fusion_config.nms_window_frames,
         },
+        run_profile=run_profile,
+        asr_mode=asr_mode,
+        visual_mode=visual_mode,
+        quality_flags=quality_flags,
+        step_timings=step_timings,
+        boundary_quality=boundary_quality,
+        capability_matrix=preflight_capabilities,
         notes=[*config_notes, *source_notes],
     )
 
@@ -510,6 +1056,9 @@ def build_analysis_timeline(
         word_segments=word_segments,
         visual_flags=visual_flags,
         rating_evidence=rating_evidence,
+        safe_cut_points=safe_cut_points,
+        edit_context_windows=edit_context_windows,
+        continuity_features=continuity_features,
         boundaries=boundary_models,
         metadata=metadata,
     )
@@ -520,6 +1069,20 @@ def build_analysis_timeline(
     output_path.write_text(
         json.dumps(timeline.model_dump(mode="json"), indent=2),
         encoding="utf-8",
+    )
+    quality_report_path = output_dir / "analysis_quality_report.json"
+    quality_report_path.write_text(
+        json.dumps(quality_report.model_dump(mode="json"), indent=2),
+        encoding="utf-8",
+    )
+    _emit(
+        progress,
+        (
+            "Quality report written: "
+            f"passed={quality_report.passed} "
+            f"critical={len(quality_report.critical_findings)} "
+            f"warnings={len(quality_report.warnings)}"
+        ),
     )
     return timeline, output_path
 
@@ -594,6 +1157,9 @@ def main() -> None:
     def _download_detail(message: str) -> None:
         print(f"  [download] {message}", flush=True)
 
+    def _speech_detail(message: str) -> None:
+        print(f"  [speech] {message}", flush=True)
+
     parser = _build_cli()
     args = parser.parse_args()
     sources_selected = sum(
@@ -621,9 +1187,11 @@ def main() -> None:
         config_path=args.config,
         progress=step_printer,
         download_progress=_download_detail,
+        speech_progress=_speech_detail,
     )
     step_printer("Analysis completed.")
     print(f"analysis_timeline: {output_path}")
+    print(f"analysis_quality_report: {output_path.parent / 'analysis_quality_report.json'}")
     print(f"duration_sec: {timeline.duration_sec}")
     print(f"fps: {timeline.fps}")
     print(f"scene_count: {len(timeline.scenes)}")

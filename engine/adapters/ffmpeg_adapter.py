@@ -179,7 +179,8 @@ def _extract_luma_mean_map_for_frames(
     video_path: str | Path,
     frames: list[int],
     *,
-    max_select_frames: int = 600,
+    fps: float | None = None,
+    max_select_frames: int = 80,
 ) -> dict[int, float]:
     """Read per-frame luma means for specific frame indices."""
     if not frames:
@@ -189,10 +190,14 @@ def _extract_luma_mean_map_for_frames(
     if not unique_frames:
         return {}
 
-    mean_by_frame: dict[int, float] = {}
-    for start in range(0, len(unique_frames), max_select_frames):
-        chunk = unique_frames[start : start + max_select_frames]
-        select_parts = [f"eq(n\\,{frame})" for frame in chunk]
+    resolved_fps = float(fps or 0.0)
+    if resolved_fps <= 0:
+        resolved_fps = probe_video(video_path).fps
+
+    def _run_chunk(chunk_frames: list[int], sink: dict[int, float]) -> None:
+        if not chunk_frames:
+            return
+        select_parts = [f"eq(n\\,{frame})" for frame in chunk_frames]
         filter_expr = f"select='{'+'.join(select_parts)}',showinfo"
         result = subprocess.run(
             [
@@ -214,23 +219,39 @@ def _extract_luma_mean_map_for_frames(
             text=True,
         )
         output = f"{result.stdout}\n{result.stderr}"
+        parsed = 0
         for line in output.splitlines():
             if "showinfo" not in line:
                 continue
-            frame_match = re.search(r"n:\s*([0-9]+)", line)
+            pts_match = re.search(r"pts_time:([0-9.]+)", line)
             mean_match = re.search(r"mean:\[([0-9 ]+)\]", line)
-            if not frame_match or not mean_match:
+            if not pts_match or not mean_match:
                 continue
             first_channel = mean_match.group(1).split()[0]
-            mean_by_frame[int(frame_match.group(1))] = float(first_channel)
+            pts_time = float(pts_match.group(1))
+            frame_index = max(0, int(round(pts_time * resolved_fps)))
+            sink[frame_index] = float(first_channel)
+            parsed += 1
+
+        if parsed == 0 and len(chunk_frames) > 1:
+            midpoint = len(chunk_frames) // 2
+            _run_chunk(chunk_frames[:midpoint], sink)
+            _run_chunk(chunk_frames[midpoint:], sink)
+
+    mean_by_frame: dict[int, float] = {}
+    for start in range(0, len(unique_frames), max_select_frames):
+        chunk = unique_frames[start : start + max_select_frames]
+        _run_chunk(chunk, mean_by_frame)
     return mean_by_frame
 
 
-def local_frame_delta_score(video_path: str | Path, frame_index: int) -> float:
+def local_frame_delta_score(
+    video_path: str | Path, frame_index: int, *, fps: float | None = None
+) -> float:
     """Estimate local frame delta around a boundary frame as [0, 1]."""
     previous_frame = max(0, frame_index - 1)
     mean_by_frame = _extract_luma_mean_map_for_frames(
-        video_path, [previous_frame, frame_index]
+        video_path, [previous_frame, frame_index], fps=fps
     )
     prev_mean = mean_by_frame.get(previous_frame)
     curr_mean = mean_by_frame.get(frame_index)
@@ -241,7 +262,10 @@ def local_frame_delta_score(video_path: str | Path, frame_index: int) -> float:
 
 
 def local_frame_delta_scores(
-    video_path: str | Path, frame_indices: list[int]
+    video_path: str | Path,
+    frame_indices: list[int],
+    *,
+    fps: float | None = None,
 ) -> dict[int, float]:
     """Estimate local frame deltas for multiple frame indices."""
     if not frame_indices:
@@ -253,7 +277,11 @@ def local_frame_delta_scores(
         probe_frames.append(max(0, frame_idx - 1))
         probe_frames.append(frame_idx)
 
-    mean_by_frame = _extract_luma_mean_map_for_frames(video_path, probe_frames)
+    mean_by_frame = _extract_luma_mean_map_for_frames(
+        video_path,
+        probe_frames,
+        fps=fps,
+    )
     scores: dict[int, float] = {}
     for frame_idx in target_frames:
         prev_frame = max(0, frame_idx - 1)

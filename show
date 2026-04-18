@@ -39,6 +39,82 @@ read_first_url_line() {
   ' "$file_path"
 }
 
+print_asr_status() {
+  timeline_file=$1
+  if ! command -v python3 >/dev/null 2>&1; then
+    printf '%s\n' "asr_status: unknown (python3 not found)"
+    return
+  fi
+
+  summary=$(
+    python3 - "$timeline_file" <<'PY'
+import json
+import sys
+
+timeline_path = sys.argv[1]
+try:
+    with open(timeline_path, "r", encoding="utf-8") as f:
+        timeline = json.load(f)
+except Exception as exc:
+    print(f"asr_status: unknown ({exc.__class__.__name__})")
+    raise SystemExit(0)
+
+speech_segments = timeline.get("speech_segments") or []
+metadata = timeline.get("metadata") or {}
+adapter_status = (metadata.get("adapter_status") or {}).get("whisperx") or {}
+openai_status = (metadata.get("adapter_status") or {}).get("openai_whisper") or {}
+asr_mode = str(metadata.get("asr_mode") or "unknown")
+state = str(adapter_status.get("state") or "unknown")
+detail = str(adapter_status.get("detail") or "").strip()
+openai_state = str(openai_status.get("state") or "unknown")
+
+if speech_segments:
+    print(
+      f"asr_status: mode={asr_mode}, whisperx={state}, openai_whisper={openai_state}, speech_segments={len(speech_segments)}"
+    )
+else:
+    reason = detail if detail else "no speech segments produced"
+    print(
+      f"asr_status: mode={asr_mode}, whisperx={state}, openai_whisper={openai_state}, speech_segments=0 ({reason})"
+    )
+PY
+  )
+
+  if [ -n "$summary" ]; then
+    printf '%s\n' "$summary"
+  else
+    printf '%s\n' "asr_status: unknown"
+  fi
+}
+
+print_quality_status() {
+  report_file=$1
+  if [ ! -f "$report_file" ]; then
+    printf '%s\n' "quality_report: missing"
+    return
+  fi
+  if ! command -v python3 >/dev/null 2>&1; then
+    printf '%s\n' "quality_report: present (python3 not found for summary)"
+    return
+  fi
+  python3 - "$report_file" <<'PY'
+import json
+import sys
+path = sys.argv[1]
+try:
+    data = json.load(open(path, "r", encoding="utf-8"))
+except Exception as exc:
+    print(f"quality_report: unreadable ({exc.__class__.__name__})")
+    raise SystemExit(0)
+passed = bool(data.get("passed"))
+critical = len(data.get("critical_findings") or [])
+warnings = len(data.get("warnings") or [])
+planner = bool(data.get("planner_eligible"))
+print(f"quality_report: {path}")
+print(f"quality_status: passed={str(passed).lower()} planner_eligible={str(planner).lower()} critical={critical} warnings={warnings}")
+PY
+}
+
 show_status() {
   printf '%s\n' "Softcut Status"
   printf '%s\n' "-------------"
@@ -105,6 +181,8 @@ show_status() {
     timeline_path="$artifacts_root/$job_id/analysis_timeline.json"
     if [ -f "$timeline_path" ]; then
       printf '%s\n' "analysis_timeline: $timeline_path"
+      print_asr_status "$timeline_path"
+      print_quality_status "$artifacts_root/$job_id/analysis_quality_report.json"
     else
       printf '%s\n' "analysis_timeline: missing for job_id=$job_id"
     fi

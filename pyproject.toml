@@ -17,8 +17,11 @@ dependencies = [
 
 [project.optional-dependencies]
 analysis-ml = [
+  "numpy<2",
   "scenedetect>=0.6,<1",
   "opennsfw2>=0.10,<1",
+  "transformers<5",
+  "openai-whisper>=20231117",
   "whisperx>=3,<4",
 ]
 ingest = [

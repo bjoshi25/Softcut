@@ -109,6 +109,45 @@ class RatingEvidence(BaseModel):
     references: dict[str, str] = Field(default_factory=dict)
 
 
+class SafeCutPoint(BaseModel):
+    """Candidate low-risk cut anchor around flagged evidence."""
+
+    point_id: str
+    sec: float = Field(ge=0.0)
+    frame_index: int = Field(ge=0)
+    kind: str
+    motion_score: float = Field(ge=0.0, le=1.0, default=0.0)
+    speech_density: float = Field(ge=0.0, le=1.0, default=0.0)
+    boundary_confidence: float = Field(ge=0.0, le=1.0, default=0.0)
+    references: dict[str, str] = Field(default_factory=dict)
+
+
+class EditContextWindow(BaseModel):
+    """Edit window with compatibility hints for planner."""
+
+    window_id: str
+    evidence_id: str
+    start_sec: float = Field(ge=0.0)
+    end_sec: float = Field(ge=0.0)
+    pre_pad_sec: float = Field(ge=0.0, default=0.0)
+    post_pad_sec: float = Field(ge=0.0, default=0.0)
+    overlap_tag: str
+    compatible_actions: list[str] = Field(default_factory=list)
+
+
+class ContinuityFeature(BaseModel):
+    """Continuity features around a candidate edit region."""
+
+    feature_id: str
+    start_sec: float = Field(ge=0.0)
+    end_sec: float = Field(ge=0.0)
+    motion_score: float = Field(ge=0.0, le=1.0, default=0.0)
+    speech_density: float = Field(ge=0.0, le=1.0, default=0.0)
+    scene_proximity_sec: float = Field(ge=0.0, default=0.0)
+    boundary_confidence: float = Field(ge=0.0, le=1.0, default=0.0)
+    references: dict[str, str] = Field(default_factory=dict)
+
+
 class AnalysisMetadata(BaseModel):
     """Metadata for reproducibility and auditability."""
 
@@ -119,6 +158,13 @@ class AnalysisMetadata(BaseModel):
     detector_configs: dict[str, Any] = Field(default_factory=dict)
     adapter_status: dict[str, AdapterStatus] = Field(default_factory=dict)
     fusion: dict[str, Any] = Field(default_factory=dict)
+    run_profile: str = "degraded"
+    asr_mode: str = "failed"
+    visual_mode: str = "disabled"
+    quality_flags: list[str] = Field(default_factory=list)
+    step_timings: dict[str, float] = Field(default_factory=dict)
+    boundary_quality: dict[str, Any] = Field(default_factory=dict)
+    capability_matrix: dict[str, Any] = Field(default_factory=dict)
     notes: list[str] = Field(default_factory=list)
 
 
@@ -134,8 +180,23 @@ class AnalysisTimeline(BaseModel):
     word_segments: list[WordSegment] = Field(default_factory=list)
     visual_flags: list[VisualFlag] = Field(default_factory=list)
     rating_evidence: list[RatingEvidence] = Field(default_factory=list)
+    safe_cut_points: list[SafeCutPoint] = Field(default_factory=list)
+    edit_context_windows: list[EditContextWindow] = Field(default_factory=list)
+    continuity_features: list[ContinuityFeature] = Field(default_factory=list)
     boundaries: list[SceneBoundary] = Field(default_factory=list)
     metadata: AnalysisMetadata = Field(default_factory=AnalysisMetadata)
+
+
+class AnalysisQualityReport(BaseModel):
+    """Quality verdict for whether Step 1 output is planner-ready."""
+
+    job_id: str
+    run_profile: str
+    passed: bool
+    critical_findings: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    next_actions: list[str] = Field(default_factory=list)
+    planner_eligible: bool = False
 
 
 def frame_to_seconds(frame_index: int, fps: float) -> float:
