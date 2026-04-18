@@ -85,3 +85,94 @@ sh scripts/check-env.sh
 ```
 
 Both scripts are non-destructive and avoid installing dependencies.
+
+## Softcut MVP (Phase 1 Step 1)
+
+This repository now contains a runnable fused analysis engine for local videos.
+
+Core flow:
+
+```text
+data/inbox/input.mp4
+-> artifacts/{job_id}/analysis_timeline.json
+```
+
+### Two-word run commands
+
+1) Install Node workspace deps (uses `pnpm-lock.yaml` in frozen mode once lockfile exists):
+
+```sh
+./run install
+```
+
+The runner now defaults Python extras to `analysis-ml,ingest`, so no export is required.
+
+2) (Optional, one-time per shell) enable `run ...` without `./`:
+
+```sh
+export PATH="/Users/bhrigujoshi/Desktop/Projects/Softcut:$PATH"
+```
+
+3) Put your URL in file:
+
+```sh
+printf '%s\n' 'https://www.youtube.com/watch?v=7cLTW934VR8' > data/inbox/url.txt
+```
+
+4) Edit [configs/project.yaml](/Users/bhrigujoshi/Desktop/Projects/Softcut/configs/project.yaml):
+- `analysis_run.source.mode`: `input` | `url` | `url_file`
+- `analysis_run.source.url_file`: path to your saved URL file (e.g. `data/inbox/url.txt`)
+- `analysis_run.job_id`: output job id
+
+5) Run analysis:
+
+```sh
+./run analysis
+```
+
+API:
+
+```sh
+./run api
+```
+
+Status (second two-word command):
+
+```sh
+./show status
+```
+
+### Direct script options (still supported)
+
+Local file:
+
+```sh
+./run analysis-cli --input data/inbox/input.mp4 --job-id local_001
+```
+
+URL:
+
+```sh
+./run analysis-cli \
+  --url "https://www.youtube.com/watch?v=7cLTW934VR8" \
+  --job-id local_yt_001
+```
+
+URL from file:
+
+```sh
+./run analysis-cli \
+  --url-file data/inbox/url.txt \
+  --job-id local_yt_file_001
+```
+
+Then create a local analysis job:
+
+```sh
+curl -X POST http://localhost:8000/analysis/jobs/local \
+  -H "Content-Type: application/json" \
+  -d '{
+    "input_video_path": "data/inbox/input.mp4",
+    "job_id": "local_001"
+  }'
+```

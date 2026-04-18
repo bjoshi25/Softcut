@@ -8,10 +8,18 @@ Thumbs.db
 *.swp
 *.swo
 
+# Node workspace files
+node_modules/
+.nx/
+
 # Local environment files
 .env
 .env.*
 !.env.example
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
 
 # Logs and temporary output
 *.log
@@ -26,3 +34,6 @@ temp/
 artifacts/
 reports/
 out/
+data/work/
+data/inbox/
+!data/inbox/.gitkeep

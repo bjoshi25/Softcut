@@ -1,0 +1,13 @@
+{
+  "name": "analysis",
+  "$schema": "./node_modules/nx/schemas/project-schema.json",
+  "targets": {
+    "run": {
+      "executor": "nx:run-commands",
+      "options": {
+        "cwd": ".",
+        "command": "sh scripts/run-analysis-config.sh {args}"
+      }
+    }
+  }
+}

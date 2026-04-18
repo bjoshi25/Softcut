@@ -1,0 +1,48 @@
+#!/usr/bin/env sh
+set -eu
+
+repo_root=$(CDPATH= cd "$(dirname "$0")" && pwd)
+cd "$repo_root"
+
+print_help() {
+  printf '%s\n' "Usage: run <task> [args]"
+  printf '\n'
+  printf '%s\n' "Tasks:"
+  printf '%s\n' "  analysis        Run config-driven analysis (configs/project.yaml)"
+  printf '%s\n' "  analysis-cli    Run analysis CLI directly (pass --input/--url/--url-file etc.)"
+  printf '%s\n' "  api             Run local FastAPI server"
+  printf '%s\n' "  install         Run Node install helper (frozen lockfile when available)"
+  printf '%s\n' "  check           Run template checks"
+  printf '%s\n' "  help            Show this help"
+}
+
+task=${1:-help}
+if [ "$#" -gt 0 ]; then
+  shift
+fi
+
+case "$task" in
+  analysis)
+    exec sh scripts/run-analysis-config.sh --config configs/project.yaml "$@"
+    ;;
+  analysis-cli)
+    exec sh scripts/run-analysis.sh "$@"
+    ;;
+  api)
+    exec sh scripts/run-api.sh "$@"
+    ;;
+  install)
+    exec sh scripts/install-node.sh "$@"
+    ;;
+  check)
+    exec sh scripts/check-env.sh "$@"
+    ;;
+  help)
+    print_help
+    ;;
+  *)
+    printf '%s\n' "Unknown task: $task" >&2
+    print_help >&2
+    exit 1
+    ;;
+esac

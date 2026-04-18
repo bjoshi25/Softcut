@@ -1,0 +1,128 @@
+#!/usr/bin/env sh
+set -eu
+
+repo_root=$(CDPATH= cd "$(dirname "$0")" && pwd)
+cd "$repo_root"
+
+config_path=${SOFTCUT_PROJECT_CONFIG:-configs/project.yaml}
+
+yaml_value() {
+  key=$1
+  file=$2
+  awk -F':' -v target="$key" '
+    $0 ~ "^[[:space:]]*" target "[[:space:]]*:" {
+      value = substr($0, index($0, ":") + 1)
+      sub(/^[[:space:]]+/, "", value)
+      sub(/[[:space:]]+$/, "", value)
+      gsub(/^"|"$/, "", value)
+      gsub(/^'\''|'\''$/, "", value)
+      print value
+      exit
+    }
+  ' "$file"
+}
+
+print_help() {
+  printf '%s\n' "Usage: show <topic>"
+  printf '\n'
+  printf '%s\n' "Topics:"
+  printf '%s\n' "  status    Show config + source + artifact status"
+  printf '%s\n' "  help      Show this help"
+}
+
+read_first_url_line() {
+  file_path=$1
+  awk '
+    /^[[:space:]]*$/ { next }
+    /^[[:space:]]*#/ { next }
+    { print; exit }
+  ' "$file_path"
+}
+
+show_status() {
+  printf '%s\n' "Softcut Status"
+  printf '%s\n' "-------------"
+  printf '%s\n' "repo: $repo_root"
+  printf '%s\n' "config: $config_path"
+
+  if [ ! -f "$config_path" ]; then
+    printf '%s\n' "config_status: missing"
+    exit 1
+  fi
+
+  job_id=$(yaml_value "job_id" "$config_path" || true)
+  source_mode=$(yaml_value "mode" "$config_path" || true)
+  input_video_path=$(yaml_value "input_video_path" "$config_path" || true)
+  source_url=$(yaml_value "url" "$config_path" || true)
+  source_url_file=$(yaml_value "url_file" "$config_path" || true)
+  artifacts_root=$(yaml_value "artifacts_root" "$config_path" || true)
+
+  if [ -z "$artifacts_root" ]; then
+    artifacts_root="artifacts"
+  fi
+
+  printf '%s\n' "job_id: ${job_id:-<unset>}"
+  printf '%s\n' "source_mode: ${source_mode:-<unset>}"
+
+  case "$source_mode" in
+    input)
+      if [ -n "$input_video_path" ] && [ -f "$input_video_path" ]; then
+        printf '%s\n' "source_input: $input_video_path (exists)"
+      else
+        printf '%s\n' "source_input: ${input_video_path:-<unset>} (missing)"
+      fi
+      ;;
+    url)
+      if [ -n "$source_url" ]; then
+        printf '%s\n' "source_url: $source_url"
+      else
+        printf '%s\n' "source_url: <unset>"
+      fi
+      ;;
+    url_file)
+      if [ -n "$source_url_file" ] && [ -f "$source_url_file" ]; then
+        resolved_url=$(read_first_url_line "$source_url_file" || true)
+        printf '%s\n' "source_url_file: $source_url_file (exists)"
+        printf '%s\n' "resolved_url: ${resolved_url:-<no usable lines>}"
+      else
+        printf '%s\n' "source_url_file: ${source_url_file:-<unset>} (missing)"
+      fi
+      ;;
+    *)
+      printf '%s\n' "source: unknown mode"
+      ;;
+  esac
+
+  printf '%s\n' "artifacts_root: $artifacts_root"
+  if [ -d "$artifacts_root" ]; then
+    job_count=$(find "$artifacts_root" -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' ')
+    printf '%s\n' "artifact_jobs: $job_count"
+  else
+    printf '%s\n' "artifact_jobs: 0 (directory missing)"
+  fi
+
+  if [ -n "$job_id" ]; then
+    timeline_path="$artifacts_root/$job_id/analysis_timeline.json"
+    if [ -f "$timeline_path" ]; then
+      printf '%s\n' "analysis_timeline: $timeline_path"
+    else
+      printf '%s\n' "analysis_timeline: missing for job_id=$job_id"
+    fi
+  fi
+}
+
+topic=${1:-help}
+
+case "$topic" in
+  status)
+    show_status
+    ;;
+  help)
+    print_help
+    ;;
+  *)
+    printf '%s\n' "Unknown topic: $topic" >&2
+    print_help >&2
+    exit 1
+    ;;
+esac

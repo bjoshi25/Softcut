@@ -1,0 +1,23 @@
+project:
+  name: softcut-local
+
+analysis_run:
+  job_id: local_from_config_001
+
+  source:
+    # one of: input | url | url_file
+    mode: url_file
+    input_video_path: data/inbox/input.mp4
+    url: https://www.youtube.com/watch?v=7cLTW934VR8
+    url_file: data/inbox/url.txt
+
+  paths:
+    artifacts_root: artifacts
+    work_root: data/work
+    download_dir: data/inbox
+
+  settings:
+    sample_every_sec: null
+    max_visual_samples: null
+    diarize: false
+    analysis_config_path: configs/analysis.yaml

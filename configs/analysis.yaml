@@ -1,0 +1,22 @@
+fusion:
+  cluster_tolerance_frames: 8
+  nms_window_frames: 8
+
+adapters:
+  pyscenedetect:
+    threshold: 27.0
+    min_scene_len_sec: 0.8
+    ffmpeg_scene_threshold: 0.35
+  transnetv2:
+    threshold: 0.50
+    min_gap_frames: 4
+  whisperx:
+    model_name: small
+    batch_size: 8
+    diarize: false
+  opennsfw2:
+    threshold: 0.65
+
+sampling:
+  sample_every_sec: 5.0
+  max_visual_samples: 90
