@@ -7,11 +7,14 @@ fusion:
 adapters:
   pyscenedetect:
     threshold: 27.0
-    min_scene_len_sec: 0.8
+    min_scene_len_sec: 1.0
     ffmpeg_scene_threshold: 0.35
   transnetv2:
-    threshold: 0.50
-    min_gap_frames: 4
+    threshold: 0.58
+    min_gap_frames: 8
+    # Optional path to real TransNetV2 saved model weights directory.
+    # Use this when default package weights are Git LFS pointers.
+    model_dir: null
   whisperx:
     model_name: tiny
     # Set to a known language (e.g. "en") to skip auto-detection and speed up ASR.
@@ -34,11 +37,32 @@ adapters:
     language: en
     min_segments_for_use: 10
   opennsfw2:
-    threshold: 0.65
-
-sampling:
-  sample_every_sec: 5.0
-  max_visual_samples: 90
+    # Default strategy for CPU-friendly recall: scene-aware sparse + dense fallback.
+    mode: scene_aware_sparse
+    # Lower recall threshold for trailers; calibrated against sampled score tails.
+    threshold: 0.25
+    # Coarse global stride for broad scan (OpenNSFW2 default is 8 for video).
+    frame_interval: 8
+    aggregation_size: 1
+    # Higher batch size speeds up inference on capable machines.
+    batch_size: 8
+    progress_bar: false
+    # If no frame crosses threshold but the score distribution has a real tail,
+    # lower the active threshold to the high-percentile score above this floor.
+    calibration_floor: 0.18
+    calibration_quantile: 0.995
+    # Merge nearby frame hits into one edit event so cuts stay smooth.
+    merge_gap_sec: 1.0
+    max_flags_per_minute: 18.0
+    # Scene-aware representative coverage knobs.
+    per_scene_max_frames: 4
+    boundary_cluster_sec: 0.4
+    long_scene_stride_sec: 2.0
+    # Suspicious-window dense fallback knobs.
+    suspicious_score_ratio: 0.75
+    dense_window_sec: 1.5
+    dense_frame_interval: 1
+    max_dense_windows: 16
 
 quality:
   min_evidence_per_minute: 0.4
@@ -49,3 +73,14 @@ quality:
 
 runtime:
   asr_timeout_sec: 900
+  visual_timeout_sec: 1800
+  # Heartbeat frequency for long-running visual scan step messages.
+  visual_progress_interval_sec: 15.0
+  # Thread knobs for TensorFlow/OpenNSFW2 worker process (increase for speed).
+  visual_omp_threads: 2
+  visual_tf_interop_threads: 2
+  visual_tf_intraop_threads: 2
+  # Overwrite current job folder and keep artifacts compact.
+  overwrite_job_artifacts: true
+  prune_other_artifacts: true
+  keep_artifact_jobs: 1

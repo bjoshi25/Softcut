@@ -11,11 +11,12 @@ Phase 1 Step 1 (fused analysis engine) and local API entrypoints.
 - `engine/analysis/run_from_config.py` loads `configs/project.yaml` and runs
   analysis from project-level source/path settings.
 - `engine/adapters/` owns tool/model boundaries:
-  - `ffmpeg_adapter.py` for probe/frame extraction/local frame delta checks.
+  - `ffmpeg_adapter.py` for probe and local frame delta checks.
   - `pyscenedetect_adapter.py` for deterministic scene cuts (+ FFmpeg fallback).
   - `transnetv2_adapter.py` for learned shot-boundary proposals.
   - `whisperx_adapter.py` for ASR/word timing (+ optional diarization).
-  - `opennsfw2_adapter.py` for sampled visual risk scoring.
+  - `opennsfw2_adapter.py` for scene-aware sparse visual scoring with dense
+    local fallback, threshold calibration, and event debouncing.
   - `yt_dlp_adapter.py` for URL-to-local video ingestion.
 - `engine/fusion/boundary_fusion.py` owns confidence-weighted temporal fusion.
 - `engine/schemas/timeline.py` defines typed artifact contracts (Pydantic).
@@ -34,7 +35,7 @@ data/inbox/input.mp4
 - media metadata (`fps`, `duration_sec`)
 - fused `boundaries` and derived `scenes`
 - speech/word timing arrays when WhisperX is available
-- visual flags when OpenNSFW2 is available
+- debounced visual flags when OpenNSFW2 is available
 - rating evidence seeds for policy/planning in Step 2
 - detector configs and adapter availability/version status
 
@@ -46,6 +47,15 @@ data/inbox/input.mp4
 - Missing PySceneDetect: use FFmpeg scene filter fallback.
 
 No single unavailable ML adapter should crash the whole analysis job.
+
+Visual analysis defaults to scene-aware sparse scoring: coarse global stride
+plus representative scene coverage, then dense rescans only around suspicious
+windows. This keeps recall-focused behavior while reducing CPU cost on
+non-GPU machines. Long-running scans emit periodic heartbeat progress messages.
+
+Artifact output is job-scoped at `artifacts/{job_id}`. Runtime config can
+overwrite the current job folder and prune older job folders to keep the
+artifact tree compact.
 
 ## Local Execution
 

@@ -2,6 +2,7 @@ project:
   name: softcut-local
 
 analysis_run:
+  # Keep this stable to overwrite one artifact folder run-to-run.
   job_id: local_from_config_001
 
   source:
@@ -17,7 +18,9 @@ analysis_run:
     download_dir: data/inbox
 
   settings:
-    sample_every_sec: null
-    max_visual_samples: null
     diarize: false
+    # Optional overrides; null means use configs/analysis.yaml runtime defaults.
+    overwrite_job_artifacts: null
+    prune_other_artifacts: null
+    keep_artifact_jobs: null
     analysis_config_path: configs/analysis.yaml

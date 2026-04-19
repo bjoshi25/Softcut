@@ -54,6 +54,11 @@ class AnalysisHardeningTests(unittest.TestCase):
                 detail="missing",
                 config={},
             ),
+            opennsfw_status=AdapterStatus(
+                state=AdapterState.unavailable,
+                detail="missing",
+                config={},
+            ),
             quality_cfg={
                 "extreme_cut_per_minute": 45.0,
                 "min_evidence_per_minute": 0.4,
@@ -65,6 +70,35 @@ class AnalysisHardeningTests(unittest.TestCase):
         self.assertFalse(report.planner_eligible)
         self.assertIn("strict_requires_transnet", report.critical_findings)
         self.assertIn("strict_requires_visual", report.critical_findings)
+
+    def test_quality_report_strict_accepts_scene_aware_visual_mode(self) -> None:
+        report = _build_quality_report(
+            job_id="job_y",
+            run_profile="strict",
+            duration_sec=120.0,
+            rating_evidence=[],
+            boundary_models=[],
+            local_scores={},
+            asr_mode="full",
+            visual_mode="scene_aware_sparse",
+            transnet_status=AdapterStatus(
+                state=AdapterState.available,
+                detail=None,
+                config={},
+            ),
+            opennsfw_status=AdapterStatus(
+                state=AdapterState.available,
+                detail=None,
+                config={"visual_flag_count": 0, "max_score": 0.19},
+            ),
+            quality_cfg={
+                "extreme_cut_per_minute": 45.0,
+                "min_evidence_per_minute": 0.4,
+                "strict_requires_transnet": True,
+                "strict_requires_visual": True,
+            },
+        )
+        self.assertNotIn("strict_requires_visual", report.critical_findings)
 
 
 if __name__ == "__main__":

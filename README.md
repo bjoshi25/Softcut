@@ -105,6 +105,12 @@ data/inbox/input.mp4
 ./run install
 ```
 
+Install optional free adapters for fuller analysis quality (OpenNSFW2 runtime + TransNetV2):
+
+```sh
+./run adapters
+```
+
 The runner now defaults Python extras to `analysis-ml,ingest`, so no export is required.
 
 2) (Optional, one-time per shell) enable `run ...` without `./`:
@@ -134,6 +140,22 @@ printf '%s\n' 'https://www.youtube.com/watch?v=7cLTW934VR8' > data/inbox/url.txt
 This now writes two artifacts:
 - `artifacts/<job_id>/analysis_timeline.json`
 - `artifacts/<job_id>/analysis_quality_report.json`
+
+Visual analysis defaults to a scene-aware sparse strategy: coarse global
+sampling plus representative scene frames, then dense local rescans only around
+suspicious windows. The resulting hits are calibrated from score distribution
+and merged into smoother edit events.
+
+Runtime notes:
+- Step 12 now emits heartbeat progress while visual scan runs.
+- `runtime.overwrite_job_artifacts: true` rewrites the current job folder.
+- `runtime.prune_other_artifacts: true` with `runtime.keep_artifact_jobs: 1`
+  keeps artifacts compact by removing older job folders after a successful run.
+- Speed knobs live in `configs/analysis.yaml`:
+  `adapters.opennsfw2.batch_size`,
+  `runtime.visual_omp_threads`,
+  `runtime.visual_tf_interop_threads`,
+  `runtime.visual_tf_intraop_threads`.
 
 For production-grade planning inputs, set `run_profile: strict` in `configs/analysis.yaml`.
 
@@ -170,7 +192,10 @@ URL from file:
 ```sh
 ./run analysis-cli \
   --url-file data/inbox/url.txt \
-  --job-id local_yt_file_001
+  --job-id local_yt_file_001 \
+  --overwrite-job-artifacts \
+  --prune-other-artifacts \
+  --keep-artifact-jobs 1
 ```
 
 Then create a local analysis job:

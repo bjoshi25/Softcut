@@ -87,7 +87,7 @@ class WordSegment(BaseModel):
 
 
 class VisualFlag(BaseModel):
-    """Visual safety signal sampled from video frames."""
+    """Visual safety signal from video-frame analysis."""
 
     flag_id: str
     sec: float = Field(ge=0.0)

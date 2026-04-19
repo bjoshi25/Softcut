@@ -21,8 +21,10 @@ analysis-ml = [
   "scenedetect>=0.6,<1",
   "opennsfw2>=0.10,<1",
   "transformers<5",
-  "openai-whisper>=20231117",
   "whisperx>=3,<4",
+]
+analysis-ml-openai-whisper = [
+  "openai-whisper>=20231117",
 ]
 ingest = [
   "yt-dlp>=2024.11",

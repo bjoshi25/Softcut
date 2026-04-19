@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import shutil
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -17,7 +18,6 @@ from engine.adapters import (
     pyscenedetect_adapter,
     subtitle_adapter,
     transnetv2_adapter,
-    visual_secondary_adapter,
     whisperx_adapter,
     yt_dlp_adapter,
 )
@@ -89,12 +89,13 @@ DEFAULT_ANALYSIS_CONFIG: dict[str, Any] = {
     "adapters": {
         "pyscenedetect": {
             "threshold": 27.0,
-            "min_scene_len_sec": 0.8,
+            "min_scene_len_sec": 1.0,
             "ffmpeg_scene_threshold": 0.35,
         },
         "transnetv2": {
-            "threshold": 0.5,
-            "min_gap_frames": 4,
+            "threshold": 0.58,
+            "min_gap_frames": 8,
+            "model_dir": None,
         },
         "whisperx": {
             "model_name": "small",
@@ -114,17 +115,29 @@ DEFAULT_ANALYSIS_CONFIG: dict[str, Any] = {
             "use_gpu": True,
         },
         "opennsfw2": {
-            "threshold": 0.65,
+            "mode": "scene_aware_sparse",
+            "threshold": 0.25,
+            "frame_interval": 8,
+            "aggregation_size": 1,
+            "batch_size": 8,
+            "progress_bar": False,
+            "calibration_floor": 0.18,
+            "calibration_quantile": 0.995,
+            "merge_gap_sec": 1.0,
+            "max_flags_per_minute": 18.0,
+            "per_scene_max_frames": 4,
+            "boundary_cluster_sec": 0.4,
+            "long_scene_stride_sec": 2.0,
+            "suspicious_score_ratio": 0.75,
+            "dense_window_sec": 1.5,
+            "dense_frame_interval": 1,
+            "max_dense_windows": 16,
         },
         "subtitle_bootstrap": {
             "enabled": False,
             "language": "en",
             "min_segments_for_use": 10,
         },
-    },
-    "sampling": {
-        "sample_every_sec": 5.0,
-        "max_visual_samples": 90,
     },
     "quality": {
         "min_evidence_per_minute": 0.4,
@@ -135,6 +148,14 @@ DEFAULT_ANALYSIS_CONFIG: dict[str, Any] = {
     },
     "runtime": {
         "asr_timeout_sec": 900,
+        "visual_timeout_sec": 1800,
+        "visual_progress_interval_sec": 15.0,
+        "visual_omp_threads": 2,
+        "visual_tf_interop_threads": 2,
+        "visual_tf_intraop_threads": 2,
+        "overwrite_job_artifacts": True,
+        "prune_other_artifacts": False,
+        "keep_artifact_jobs": 1,
     },
 }
 
@@ -167,6 +188,45 @@ def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any
         else:
             merged[key] = value
     return merged
+
+
+def _prepare_output_dir(output_dir: Path, *, overwrite: bool) -> None:
+    if overwrite and output_dir.exists():
+        shutil.rmtree(output_dir, ignore_errors=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+
+def _prune_old_artifact_dirs(
+    artifacts_root: Path,
+    *,
+    keep_job_id: str,
+    keep_count: int,
+) -> list[str]:
+    if keep_count < 1:
+        keep_count = 1
+    if not artifacts_root.exists():
+        return []
+
+    job_dirs = [path for path in artifacts_root.iterdir() if path.is_dir()]
+    if not job_dirs:
+        return []
+
+    keep_names = {keep_job_id}
+    other_dirs = [path for path in job_dirs if path.name != keep_job_id]
+    other_dirs.sort(
+        key=lambda path: path.stat().st_mtime if path.exists() else 0.0,
+        reverse=True,
+    )
+    for directory in other_dirs[: max(0, keep_count - 1)]:
+        keep_names.add(directory.name)
+
+    removed: list[str] = []
+    for directory in job_dirs:
+        if directory.name in keep_names:
+            continue
+        shutil.rmtree(directory, ignore_errors=True)
+        removed.append(directory.name)
+    return sorted(removed)
 
 
 def _load_analysis_config(config_path: str) -> tuple[dict[str, Any], list[str]]:
@@ -526,7 +586,13 @@ def _determine_asr_mode(
 
 
 def _determine_visual_mode(opennsfw_status: AdapterStatus) -> str:
-    return "full" if opennsfw_status.state == AdapterState.available else "disabled"
+    if opennsfw_status.state != AdapterState.available:
+        return "disabled"
+    mode = str(opennsfw_status.config.get("visual_mode") or opennsfw_status.config.get("mode") or "")
+    normalized = mode.strip().lower()
+    if "scene_aware_sparse" in normalized:
+        return "scene_aware_sparse"
+    return "full"
 
 
 def _build_quality_report(
@@ -540,6 +606,7 @@ def _build_quality_report(
     asr_mode: str,
     visual_mode: str,
     transnet_status: AdapterStatus,
+    opennsfw_status: AdapterStatus,
     quality_cfg: dict[str, Any],
 ) -> AnalysisQualityReport:
     warnings: list[str] = []
@@ -570,16 +637,22 @@ def _build_quality_report(
     elif asr_mode == "degraded":
         warnings.append("asr_degraded")
 
-    if visual_mode != "full":
+    visual_available = visual_mode != "disabled"
+    if not visual_available:
         warnings.append("visual_disabled")
+    elif int(opennsfw_status.config.get("visual_flag_count", 0) or 0) == 0:
+        max_score = float(opennsfw_status.config.get("max_score", 0.0) or 0.0)
+        warnings.append(f"visual_zero_flags_max_score={max_score:.3f}")
+        next_actions.append(
+            "Inspect OpenNSFW2 score diagnostics; add a complementary visual adapter "
+            "if the trailer risk is violence rather than nudity/sexual content."
+        )
 
-    planner_eligible = asr_mode != "failed" and (
-        visual_mode == "full" or run_profile != "strict"
-    )
+    planner_eligible = asr_mode != "failed" and (visual_available or run_profile != "strict")
     if run_profile == "strict":
         if bool(quality_cfg.get("strict_requires_transnet", True)) and single_detector_only:
             critical_findings.append("strict_requires_transnet")
-        if bool(quality_cfg.get("strict_requires_visual", True)) and visual_mode != "full":
+        if bool(quality_cfg.get("strict_requires_visual", True)) and not visual_available:
             critical_findings.append("strict_requires_visual")
         planner_eligible = planner_eligible and not critical_findings
 
@@ -602,9 +675,10 @@ def build_analysis_timeline(
     artifacts_root: str = "artifacts",
     work_root: str = "data/work",
     download_dir: str = "data/inbox",
-    sample_every_sec: float | None = None,
-    max_visual_samples: int | None = None,
     diarize: bool | None = None,
+    overwrite_job_artifacts: bool | None = None,
+    prune_other_artifacts: bool | None = None,
+    keep_artifact_jobs: int | None = None,
     config_path: str = "configs/analysis.yaml",
     progress: ProgressCallback | None = None,
     download_progress: ProgressCallback | None = None,
@@ -646,24 +720,28 @@ def build_analysis_timeline(
         run_profile = "degraded"
     fusion_cfg = analysis_config["fusion"]
     adapter_cfg = analysis_config["adapters"]
-    sampling_cfg = analysis_config["sampling"]
     quality_cfg = analysis_config["quality"]
     runtime_cfg = analysis_config["runtime"]
 
-    resolved_sample_every_sec = (
-        sample_every_sec
-        if sample_every_sec is not None
-        else float(sampling_cfg["sample_every_sec"])
-    )
-    resolved_max_visual_samples = (
-        max_visual_samples
-        if max_visual_samples is not None
-        else int(sampling_cfg["max_visual_samples"])
-    )
     resolved_diarize = (
         diarize
         if diarize is not None
         else bool(adapter_cfg["whisperx"].get("diarize", False))
+    )
+    resolved_overwrite_job_artifacts = (
+        overwrite_job_artifacts
+        if overwrite_job_artifacts is not None
+        else bool(runtime_cfg.get("overwrite_job_artifacts", True))
+    )
+    resolved_prune_other_artifacts = (
+        prune_other_artifacts
+        if prune_other_artifacts is not None
+        else bool(runtime_cfg.get("prune_other_artifacts", False))
+    )
+    resolved_keep_artifact_jobs = (
+        int(keep_artifact_jobs)
+        if keep_artifact_jobs is not None
+        else int(runtime_cfg.get("keep_artifact_jobs", 1))
     )
 
     _emit(progress, "Running preflight capability checks.")
@@ -708,6 +786,11 @@ def build_analysis_timeline(
         source_path,
         threshold=float(adapter_cfg["transnetv2"]["threshold"]),
         min_gap_frames=int(adapter_cfg["transnetv2"]["min_gap_frames"]),
+        model_dir=(
+            str(adapter_cfg["transnetv2"].get("model_dir")).strip()
+            if adapter_cfg["transnetv2"].get("model_dir") is not None
+            else None
+        ),
     )
     step_timings["detect_transnet_sec"] = round(time.monotonic() - stage_start, 4)
 
@@ -890,31 +973,64 @@ def build_analysis_timeline(
         word_segments, duration_sec=video_metadata.duration_sec
     )
 
-    _emit(progress, "Sampling frames for visual analysis.")
+    opennsfw_cfg = adapter_cfg["opennsfw2"]
+    _emit(
+        progress,
+        "Running scene-aware sparse visual NSFW scan (OpenNSFW2 + dense fallback).",
+    )
     stage_start = time.monotonic()
-    work_dir = Path(work_root) / job_id / "frames"
-    sampled_frames = ffmpeg_adapter.extract_sampled_frames(
+    scene_segments_payload = [
+        {
+            "start_frame": scene.start_frame,
+            "end_frame": scene.end_frame,
+            "start_sec": scene.start_sec,
+            "end_sec": scene.end_sec,
+        }
+        for scene in scenes
+    ]
+    visual_flags, opennsfw_status = opennsfw2_adapter.score_full_video(
         source_path,
-        duration_sec=video_metadata.duration_sec,
-        output_dir=work_dir,
-        sample_every_sec=resolved_sample_every_sec,
-        max_samples=resolved_max_visual_samples,
-    )
-    step_timings["sample_frames_sec"] = round(time.monotonic() - stage_start, 4)
-    _emit(progress, "Running visual NSFW scoring (OpenNSFW2 when available).")
-    stage_start = time.monotonic()
-    visual_flags, opennsfw_status = opennsfw2_adapter.score_sampled_frames(
-        sampled_frames,
         fps=video_metadata.fps,
-        threshold=float(adapter_cfg["opennsfw2"]["threshold"]),
+        duration_sec=video_metadata.duration_sec,
+        visual_mode=str(opennsfw_cfg.get("mode") or "scene_aware_sparse"),
+        scene_segments=scene_segments_payload,
+        threshold=float(opennsfw_cfg["threshold"]),
+        frame_interval=int(opennsfw_cfg.get("frame_interval", 8)),
+        aggregation_size=int(opennsfw_cfg.get("aggregation_size", 1)),
+        batch_size=int(opennsfw_cfg.get("batch_size", 8)),
+        progress_bar=bool(opennsfw_cfg.get("progress_bar", False)),
+        calibration_floor=float(opennsfw_cfg.get("calibration_floor", 0.18)),
+        calibration_quantile=float(opennsfw_cfg.get("calibration_quantile", 0.995)),
+        merge_gap_sec=float(opennsfw_cfg.get("merge_gap_sec", 1.0)),
+        max_flags_per_minute=float(opennsfw_cfg.get("max_flags_per_minute", 18.0)),
+        per_scene_max_frames=int(opennsfw_cfg.get("per_scene_max_frames", 4)),
+        boundary_cluster_sec=float(opennsfw_cfg.get("boundary_cluster_sec", 0.4)),
+        long_scene_stride_sec=float(opennsfw_cfg.get("long_scene_stride_sec", 2.0)),
+        suspicious_score_ratio=float(opennsfw_cfg.get("suspicious_score_ratio", 0.75)),
+        dense_window_sec=float(opennsfw_cfg.get("dense_window_sec", 1.5)),
+        dense_frame_interval=int(opennsfw_cfg.get("dense_frame_interval", 1)),
+        max_dense_windows=int(opennsfw_cfg.get("max_dense_windows", 16)),
+        timeout_sec=int(runtime_cfg.get("visual_timeout_sec", 1800)),
+        progress=(lambda message: _emit(progress, message)),
+        progress_interval_sec=float(
+            runtime_cfg.get("visual_progress_interval_sec", 15.0)
+        ),
+        omp_threads=(
+            int(runtime_cfg["visual_omp_threads"])
+            if runtime_cfg.get("visual_omp_threads") is not None
+            else None
+        ),
+        tf_interop_threads=(
+            int(runtime_cfg["visual_tf_interop_threads"])
+            if runtime_cfg.get("visual_tf_interop_threads") is not None
+            else None
+        ),
+        tf_intraop_threads=(
+            int(runtime_cfg["visual_tf_intraop_threads"])
+            if runtime_cfg.get("visual_tf_intraop_threads") is not None
+            else None
+        ),
     )
-    secondary_visual_flags, secondary_visual_status = (
-        visual_secondary_adapter.score_sampled_frames(
-            sampled_frames,
-            fps=video_metadata.fps,
-        )
-    )
-    visual_flags = [*visual_flags, *secondary_visual_flags]
     step_timings["visual_scoring_sec"] = round(time.monotonic() - stage_start, 4)
 
     _emit(progress, "Building rating evidence and writing artifact.")
@@ -970,15 +1086,19 @@ def build_analysis_timeline(
         quality_flags.append("local_delta_all_zero")
     if detector_coverage < 1.0:
         quality_flags.append("single_detector_only")
-    if visual_mode != "full":
+    if visual_mode == "disabled":
         quality_flags.append("visual_mode_disabled")
+    elif not visual_flags:
+        quality_flags.append("visual_zero_flags")
     if asr_mode != "full":
         quality_flags.append(f"asr_mode_{asr_mode}")
 
     if detector_coverage < 1.0:
         preflight_capabilities["expected_risks"].append("single_detector_fusion")
-    if visual_mode != "full":
+    if visual_mode == "disabled":
         preflight_capabilities["expected_risks"].append("visual_under_instrumented")
+    elif not visual_flags:
+        preflight_capabilities["expected_risks"].append("visual_zero_flags")
     if asr_mode != "full":
         preflight_capabilities["expected_risks"].append("asr_under_instrumented")
 
@@ -992,6 +1112,7 @@ def build_analysis_timeline(
         asr_mode=asr_mode,
         visual_mode=visual_mode,
         transnet_status=transnet_status,
+        opennsfw_status=opennsfw_status,
         quality_cfg=quality_cfg,
     )
 
@@ -1011,11 +1132,6 @@ def build_analysis_timeline(
             "openai_whisper": openai_whisper_status.config,
             "subtitle_bootstrap": subtitle_status.config,
             "opennsfw2": opennsfw_status.config,
-            "visual_secondary": secondary_visual_status.config,
-            "sampling": {
-                "sample_every_sec": resolved_sample_every_sec,
-                "max_visual_samples": resolved_max_visual_samples,
-            },
             "source_ingest": ingest_status.config,
         },
         adapter_status={
@@ -1028,7 +1144,6 @@ def build_analysis_timeline(
             "openai_whisper": openai_whisper_status,
             "subtitle_bootstrap": subtitle_status,
             "opennsfw2": opennsfw_status,
-            "visual_secondary": secondary_visual_status,
         },
         fusion={
             "candidate_count": len(pyscene_boundaries) + len(transnet_boundaries),
@@ -1064,7 +1179,7 @@ def build_analysis_timeline(
     )
 
     output_dir = Path(artifacts_root) / job_id
-    output_dir.mkdir(parents=True, exist_ok=True)
+    _prepare_output_dir(output_dir, overwrite=resolved_overwrite_job_artifacts)
     output_path = output_dir / "analysis_timeline.json"
     output_path.write_text(
         json.dumps(timeline.model_dump(mode="json"), indent=2),
@@ -1084,6 +1199,17 @@ def build_analysis_timeline(
             f"warnings={len(quality_report.warnings)}"
         ),
     )
+    if resolved_prune_other_artifacts:
+        pruned = _prune_old_artifact_dirs(
+            Path(artifacts_root),
+            keep_job_id=job_id,
+            keep_count=resolved_keep_artifact_jobs,
+        )
+        if pruned:
+            _emit(
+                progress,
+                f"Pruned old artifact folders: {', '.join(pruned)}",
+            )
     return timeline, output_path
 
 
@@ -1113,7 +1239,7 @@ def _build_cli() -> argparse.ArgumentParser:
     parser.add_argument(
         "--work-root",
         default="data/work",
-        help="Working directory for sampled frames.",
+        help="Working directory for transient analysis files.",
     )
     parser.add_argument(
         "--download-dir",
@@ -1121,16 +1247,20 @@ def _build_cli() -> argparse.ArgumentParser:
         help="Download destination directory when --url is used.",
     )
     parser.add_argument(
-        "--sample-every-sec",
-        type=float,
-        default=None,
-        help="Visual model sampling interval in seconds.",
+        "--overwrite-job-artifacts",
+        action="store_true",
+        help="Overwrite the current job artifact folder before writing outputs.",
     )
     parser.add_argument(
-        "--max-visual-samples",
+        "--prune-other-artifacts",
+        action="store_true",
+        help="Prune older artifact job folders after a successful run.",
+    )
+    parser.add_argument(
+        "--keep-artifact-jobs",
         type=int,
         default=None,
-        help="Maximum number of visual samples.",
+        help="When pruning, keep at most this many artifact job folders (including current).",
     )
     parser.add_argument(
         "--diarize",
@@ -1151,6 +1281,9 @@ def main() -> None:
             self.step = 0
 
         def __call__(self, message: str) -> None:
+            if message.startswith("Visual scan "):
+                print(f"  [visual] {message}", flush=True)
+                return
             self.step += 1
             print(f"[step {self.step:02d}] {message}", flush=True)
 
@@ -1181,9 +1314,14 @@ def main() -> None:
         artifacts_root=args.artifacts_root,
         work_root=args.work_root,
         download_dir=args.download_dir,
-        sample_every_sec=args.sample_every_sec,
-        max_visual_samples=args.max_visual_samples,
         diarize=args.diarize if args.diarize else None,
+        overwrite_job_artifacts=(
+            True if args.overwrite_job_artifacts else None
+        ),
+        prune_other_artifacts=(
+            True if args.prune_other_artifacts else None
+        ),
+        keep_artifact_jobs=args.keep_artifact_jobs,
         config_path=args.config,
         progress=step_printer,
         download_progress=_download_detail,

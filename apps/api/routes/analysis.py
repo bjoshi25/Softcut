@@ -20,9 +20,10 @@ class LocalAnalysisJobRequest(BaseModel):
     job_id: str = Field(..., description="Job identifier.")
     artifacts_root: str = "artifacts"
     work_root: str = "data/work"
-    sample_every_sec: float | None = None
-    max_visual_samples: int | None = None
     diarize: bool | None = None
+    overwrite_job_artifacts: bool | None = None
+    prune_other_artifacts: bool | None = None
+    keep_artifact_jobs: int | None = None
     config_path: str = "configs/analysis.yaml"
 
 
@@ -48,9 +49,10 @@ def create_local_analysis_job(payload: LocalAnalysisJobRequest) -> LocalAnalysis
             job_id=payload.job_id,
             artifacts_root=payload.artifacts_root,
             work_root=payload.work_root,
-            sample_every_sec=payload.sample_every_sec,
-            max_visual_samples=payload.max_visual_samples,
             diarize=payload.diarize,
+            overwrite_job_artifacts=payload.overwrite_job_artifacts,
+            prune_other_artifacts=payload.prune_other_artifacts,
+            keep_artifact_jobs=payload.keep_artifact_jobs,
             config_path=payload.config_path,
         )
     except FileNotFoundError as exc:

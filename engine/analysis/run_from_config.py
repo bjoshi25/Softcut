@@ -65,6 +65,9 @@ class _StepPrinter:
         self.step = 0
 
     def __call__(self, message: str) -> None:
+        if message.startswith("Visual scan "):
+            print(f"  [visual] {message}", flush=True)
+            return
         self.step += 1
         print(f"[step {self.step:02d}] {message}", flush=True)
 
@@ -117,19 +120,24 @@ def main() -> None:
         artifacts_root=str(paths_cfg.get("artifacts_root") or "artifacts"),
         work_root=str(paths_cfg.get("work_root") or "data/work"),
         download_dir=str(paths_cfg.get("download_dir") or "data/inbox"),
-        sample_every_sec=(
-            float(settings_cfg["sample_every_sec"])
-            if settings_cfg.get("sample_every_sec") is not None
-            else None
-        ),
-        max_visual_samples=(
-            int(settings_cfg["max_visual_samples"])
-            if settings_cfg.get("max_visual_samples") is not None
-            else None
-        ),
         diarize=(
             bool(settings_cfg["diarize"])
             if settings_cfg.get("diarize") is not None
+            else None
+        ),
+        overwrite_job_artifacts=(
+            bool(settings_cfg["overwrite_job_artifacts"])
+            if settings_cfg.get("overwrite_job_artifacts") is not None
+            else None
+        ),
+        prune_other_artifacts=(
+            bool(settings_cfg["prune_other_artifacts"])
+            if settings_cfg.get("prune_other_artifacts") is not None
+            else None
+        ),
+        keep_artifact_jobs=(
+            int(settings_cfg["keep_artifact_jobs"])
+            if settings_cfg.get("keep_artifact_jobs") is not None
             else None
         ),
         config_path=str(
