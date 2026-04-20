@@ -56,13 +56,14 @@ adapters:
     max_flags_per_minute: 18.0
     # Scene-aware representative coverage knobs.
     per_scene_max_frames: 4
+    max_coarse_frames: 240
     boundary_cluster_sec: 0.4
     long_scene_stride_sec: 2.0
     # Suspicious-window dense fallback knobs.
     suspicious_score_ratio: 0.75
     dense_window_sec: 1.5
     dense_frame_interval: 1
-    max_dense_windows: 16
+    max_dense_windows: 0
 
 quality:
   min_evidence_per_minute: 0.4

@@ -162,6 +162,7 @@ class AnalysisMetadata(BaseModel):
     asr_mode: str = "failed"
     visual_mode: str = "disabled"
     quality_flags: list[str] = Field(default_factory=list)
+    coverage_summary: dict[str, Any] = Field(default_factory=dict)
     step_timings: dict[str, float] = Field(default_factory=dict)
     boundary_quality: dict[str, Any] = Field(default_factory=dict)
     capability_matrix: dict[str, Any] = Field(default_factory=dict)
@@ -196,6 +197,7 @@ class AnalysisQualityReport(BaseModel):
     critical_findings: list[str] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
     next_actions: list[str] = Field(default_factory=list)
+    coverage_summary: dict[str, Any] = Field(default_factory=dict)
     planner_eligible: bool = False
 
 

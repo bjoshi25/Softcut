@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import bisect
 import json
 import math
 import os
@@ -252,6 +253,258 @@ def _frame_indices_from_windows(
     return sorted(set(output))
 
 
+def _merge_windows(
+    windows: list[tuple[float, float]],
+    *,
+    duration_sec: float,
+) -> list[tuple[float, float]]:
+    if not windows:
+        return []
+    safe_duration = max(0.0, float(duration_sec))
+    normalized = []
+    for start, end in windows:
+        s = max(0.0, min(safe_duration, float(start)))
+        e = max(s, min(safe_duration, float(end)))
+        normalized.append((s, e))
+    normalized.sort(key=lambda item: item[0])
+    merged: list[tuple[float, float]] = [normalized[0]]
+    for start, end in normalized[1:]:
+        prev_start, prev_end = merged[-1]
+        if start <= prev_end:
+            merged[-1] = (prev_start, max(prev_end, end))
+            continue
+        merged.append((start, end))
+    return merged
+
+
+def _windows_from_frame_indices(
+    frame_indices: list[int],
+    *,
+    fps: float,
+    radius_sec: float,
+    duration_sec: float,
+    max_windows: int,
+) -> list[tuple[float, float]]:
+    if not frame_indices or max_windows <= 0:
+        return []
+    safe_fps = fps if fps > 0 else 1.0
+    selected = _limit_evenly(
+        sorted(set(int(max(0, frame)) for frame in frame_indices)),
+        max_count=max(1, int(max_windows)),
+    )
+    safe_radius = max(0.02, float(radius_sec))
+    raw_windows = []
+    for frame in selected:
+        center = frame / safe_fps
+        raw_windows.append((center - safe_radius, center + safe_radius))
+    return _merge_windows(raw_windows, duration_sec=duration_sec)
+
+
+def _scene_sampling_coverage(
+    *,
+    scene_segments: list[dict[str, Any]],
+    sampled_seconds: list[float],
+    dense_windows: list[tuple[float, float]],
+    fps: float,
+) -> dict[str, Any]:
+    """Summarize scene-level sparse coverage and dense escalations."""
+    total_scenes = len(scene_segments)
+    baseline = {
+        "total_scenes": total_scenes,
+        "sampled_scenes": 0,
+        "sampled_scene_ratio": 0.0,
+        "avg_frames_sampled_per_scene": 0.0,
+        "escalated_scenes": 0,
+        "escalated_scene_ratio": 0.0,
+        "dense_rescans": len(dense_windows),
+    }
+    if total_scenes <= 0:
+        return baseline
+
+    safe_fps = fps if fps > 0 else 1.0
+    sampled_frames = sorted(
+        {max(0, int(round(max(0.0, float(sec)) * safe_fps))) for sec in sampled_seconds}
+    )
+    dense_window_frames = [
+        (
+            max(0, int(math.floor(max(0.0, float(start)) * safe_fps))),
+            max(0, int(math.ceil(max(0.0, float(end)) * safe_fps))),
+        )
+        for start, end in dense_windows
+    ]
+
+    sampled_scene_count = 0
+    escalated_scene_count = 0
+    sampled_frame_total = 0
+    for raw_scene in scene_segments:
+        start_frame = raw_scene.get("start_frame")
+        end_frame = raw_scene.get("end_frame")
+        if start_frame is None:
+            start_frame = int(round(max(0.0, _to_float(raw_scene.get("start_sec"))) * safe_fps))
+        if end_frame is None:
+            end_frame = int(round(max(0.0, _to_float(raw_scene.get("end_sec"))) * safe_fps))
+        start = max(0, int(start_frame))
+        end = max(start, int(end_frame))
+
+        left = bisect.bisect_left(sampled_frames, start)
+        right = bisect.bisect_right(sampled_frames, end)
+        scene_sample_count = max(0, right - left)
+        sampled_frame_total += scene_sample_count
+        if scene_sample_count > 0:
+            sampled_scene_count += 1
+
+        if any(
+            not (window_end < start or window_start > end)
+            for window_start, window_end in dense_window_frames
+        ):
+            escalated_scene_count += 1
+
+    sampled_ratio = sampled_scene_count / max(1, total_scenes)
+    escalated_ratio = escalated_scene_count / max(1, total_scenes)
+    baseline.update(
+        {
+            "sampled_scenes": sampled_scene_count,
+            "sampled_scene_ratio": round(sampled_ratio, 6),
+            "avg_frames_sampled_per_scene": round(sampled_frame_total / max(1, total_scenes), 6),
+            "escalated_scenes": escalated_scene_count,
+            "escalated_scene_ratio": round(escalated_ratio, 6),
+        }
+    )
+    return baseline
+
+
+def _extract_temporal_clip(
+    video_path: str | Path,
+    *,
+    start_sec: float,
+    end_sec: float,
+    output_path: Path,
+    target_fps: float | None = None,
+) -> tuple[bool, str | None]:
+    start = max(0.0, float(start_sec))
+    end = max(start + 0.05, float(end_sec))
+    command = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-ss",
+        f"{start:.6f}",
+        "-to",
+        f"{end:.6f}",
+        "-i",
+        str(video_path),
+        "-an",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "ultrafast",
+        "-crf",
+        "35",
+        "-pix_fmt",
+        "yuv420p",
+    ]
+    if target_fps is not None and float(target_fps) > 0:
+        command.extend(["-vf", f"fps={max(0.1, float(target_fps)):.6f}"])
+    command.append(str(output_path))
+    result = subprocess.run(command, check=False, capture_output=True, text=True)
+    if result.returncode != 0:
+        detail = (
+            (result.stderr or result.stdout or "ffmpeg_temporal_extract_failed")
+            .strip()
+            .splitlines()
+        )
+        return False, detail[-1] if detail else "ffmpeg_temporal_extract_failed"
+    if not output_path.exists() or output_path.stat().st_size <= 0:
+        return False, "empty_temporal_clip"
+    return True, None
+
+
+def _score_temporal_windows(
+    opennsfw2: Any,
+    video_path: str | Path,
+    *,
+    windows: list[tuple[float, float]],
+    fps: float,
+    duration_sec: float,
+    frame_interval: int,
+    aggregation_size: int,
+    batch_size: int,
+    progress_bar: bool,
+    target_fps: float | None,
+    clip_prefix: str,
+) -> tuple[list[float], list[float], dict[str, Any]]:
+    if not windows:
+        return [], [], {
+            "requested_window_count": 0,
+            "window_failures": 0,
+            "requested_frame_count": 0,
+            "scored_frame_count": 0,
+            "clip_extract_failed": False,
+        }
+
+    safe_fps = fps if fps > 0 else 1.0
+    safe_duration = max(0.0, float(duration_sec))
+    merged_windows = _merge_windows(windows, duration_sec=safe_duration)
+    guessed_fps = float(target_fps) if target_fps is not None else (safe_fps / max(1, int(frame_interval)))
+    guessed_fps = max(0.1, guessed_fps)
+    requested_frames = int(
+        sum(max(1.0, (end - start) * guessed_fps) for start, end in merged_windows)
+    )
+
+    all_times: list[float] = []
+    all_scores: list[float] = []
+    failures = 0
+    last_error: str | None = None
+    for index, (start, end) in enumerate(merged_windows):
+        with tempfile.TemporaryDirectory(prefix=f"{clip_prefix}_{index:04d}_") as temp_dir:
+            window_clip_path = Path(temp_dir) / "window.mp4"
+            ok, error = _extract_temporal_clip(
+                video_path,
+                start_sec=start,
+                end_sec=end,
+                output_path=window_clip_path,
+                target_fps=target_fps,
+            )
+            if not ok:
+                failures += 1
+                last_error = error
+                continue
+            elapsed_seconds, scores = _predict_video_scores(
+                opennsfw2,
+                window_clip_path,
+                frame_interval=max(1, int(frame_interval)),
+                aggregation_size=max(1, int(aggregation_size)),
+                batch_size=max(1, int(batch_size)),
+                progress_bar=progress_bar,
+            )
+            if not scores:
+                continue
+            normalized_elapsed = _normalize_elapsed_seconds(
+                elapsed_seconds,
+                score_count=len(scores),
+                fps=guessed_fps,
+            )
+            all_times.extend(
+                min(safe_duration, max(0.0, start + float(sec)))
+                for sec in normalized_elapsed
+            )
+            all_scores.extend(scores)
+
+    diagnostics = {
+        "requested_window_count": len(merged_windows),
+        "window_failures": failures,
+        "requested_frame_count": requested_frames,
+        "scored_frame_count": len(all_scores),
+        "clip_extract_failed": failures > 0 and not all_scores,
+        "partial_clip_extract_failures": failures > 0 and bool(all_scores),
+    }
+    if last_error:
+        diagnostics["clip_extract_error"] = last_error
+    return all_times, all_scores, diagnostics
+
+
 def _select_expression_for_frames(frame_indices: list[int]) -> str:
     return "+".join(f"eq(n\\,{int(frame)})" for frame in frame_indices)
 
@@ -261,12 +514,14 @@ def _extract_selected_frames_clip(
     *,
     frame_indices: list[int],
     output_path: Path,
-) -> bool:
+) -> tuple[bool, str | None]:
     if not frame_indices:
-        return False
+        return False, "no_frame_indices"
     select_expr = _select_expression_for_frames(frame_indices)
     if not select_expr:
-        return False
+        return False, "empty_select_expression"
+
+    filter_graph = f"select='{select_expr}',setpts=N/FRAME_RATE/TB"
 
     command = [
         "ffmpeg",
@@ -276,17 +531,39 @@ def _extract_selected_frames_clip(
         "-y",
         "-i",
         str(video_path),
-        "-vf",
-        f"select='{select_expr}',setpts=N/FRAME_RATE/TB",
         "-an",
         "-vsync",
         "vfr",
         str(output_path),
     ]
+    filter_script_path: Path | None = None
+    if len(filter_graph) > 4000:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            suffix=".ffscript",
+            prefix="softcut_opennsfw2_select_",
+            delete=False,
+        ) as filter_script:
+            filter_script.write(filter_graph)
+            filter_script_path = Path(filter_script.name)
+        command[8:8] = ["-filter_script:v", str(filter_script_path)]
+    else:
+        command[8:8] = ["-vf", filter_graph]
+
     result = subprocess.run(command, check=False, capture_output=True, text=True)
+    if filter_script_path is not None:
+        filter_script_path.unlink(missing_ok=True)
     if result.returncode != 0:
-        return False
-    return output_path.exists() and output_path.stat().st_size > 0
+        detail = (
+            (result.stderr or result.stdout or "ffmpeg_extract_failed")
+            .strip()
+            .splitlines()
+        )
+        return False, detail[-1] if detail else "ffmpeg_extract_failed"
+    if not output_path.exists() or output_path.stat().st_size <= 0:
+        return False, "empty_extracted_clip"
+    return True, None
 
 
 def _predict_video_scores(
@@ -326,17 +603,69 @@ def _score_selected_frames(
     safe_fps = fps if fps > 0 else 1.0
     with tempfile.TemporaryDirectory(prefix=f"{clip_prefix}_") as temp_dir:
         sampled_clip_path = Path(temp_dir) / "sampled_frames.mp4"
-        extracted = _extract_selected_frames_clip(
+        extracted, extract_error = _extract_selected_frames_clip(
             video_path,
             frame_indices=frame_indices,
             output_path=sampled_clip_path,
         )
         if not extracted:
-            return [], [], {
+            diagnostics = {
                 "requested_frame_count": len(frame_indices),
                 "scored_frame_count": 0,
                 "clip_extract_failed": True,
+                "clip_extract_error": extract_error,
             }
+            # Recovery path for parser/command limits: split into smaller chunks.
+            if len(frame_indices) <= 20:
+                return [], [], diagnostics
+
+            merged_seconds: list[float] = []
+            merged_scores: list[float] = []
+            chunk_failures = 0
+            if len(frame_indices) <= 120:
+                chunk_size = max(20, len(frame_indices) // 2)
+            else:
+                chunk_size = 120
+            for start in range(0, len(frame_indices), chunk_size):
+                chunk = frame_indices[start : start + chunk_size]
+                chunk_seconds, chunk_scores, chunk_diag = _score_selected_frames(
+                    opennsfw2,
+                    video_path,
+                    frame_indices=chunk,
+                    fps=fps,
+                    batch_size=batch_size,
+                    progress_bar=progress_bar,
+                    clip_prefix=f"{clip_prefix}_chunk",
+                )
+                if not chunk_scores:
+                    chunk_failures += 1
+                    continue
+                merged_seconds.extend(chunk_seconds)
+                merged_scores.extend(chunk_scores)
+                if chunk_diag.get("clip_extract_failed"):
+                    chunk_failures += 1
+            if not merged_scores:
+                diagnostics["chunk_recovery_attempted"] = True
+                diagnostics["chunk_recovery_failures"] = chunk_failures
+                return [], [], diagnostics
+            ordered = sorted(
+                zip(merged_seconds, merged_scores, strict=False),
+                key=lambda item: item[0],
+            )
+            diagnostics.update(
+                {
+                    "chunk_recovery_attempted": True,
+                    "chunk_recovery_failures": chunk_failures,
+                    "scored_frame_count": len(ordered),
+                    "clip_extract_failed": False,
+                }
+            )
+            return (
+                [item[0] for item in ordered],
+                [item[1] for item in ordered],
+                diagnostics,
+            )
+
         _elapsed, scores = _predict_video_scores(
             opennsfw2,
             sampled_clip_path,
@@ -389,6 +718,7 @@ def _score_scene_aware_sparse(
     batch_size: int,
     progress_bar: bool,
     per_scene_max_frames: int,
+    max_coarse_frames: int,
     boundary_cluster_sec: float,
     long_scene_stride_sec: float,
     suspicious_score_ratio: float,
@@ -397,40 +727,45 @@ def _score_scene_aware_sparse(
     max_dense_windows: int,
 ) -> tuple[list[float], list[float], dict[str, Any]]:
     safe_fps = fps if fps > 0 else 1.0
-    total_frames = max(1, int(math.ceil(max(0.01, float(duration_sec)) * safe_fps)))
-    coarse_interval = max(1, int(frame_interval))
-    global_frames = list(range(0, total_frames, coarse_interval))
-    if not global_frames or global_frames[-1] != total_frames - 1:
-        global_frames.append(total_frames - 1)
-    scene_frames = _scene_representative_frame_indices(
-        scene_segments,
-        fps=safe_fps,
-        total_frames=total_frames,
-        per_scene_max_frames=max(1, int(per_scene_max_frames)),
-        boundary_cluster_sec=boundary_cluster_sec,
-        long_scene_stride_sec=long_scene_stride_sec,
-    )
-    coarse_frames = sorted(set([*global_frames, *scene_frames]))
-    coarse_seconds, coarse_scores, coarse_diag = _score_selected_frames(
+    safe_duration = max(0.01, float(duration_sec))
+    total_frames = max(1, int(math.ceil(safe_duration * safe_fps)))
+    configured_interval = max(1, int(frame_interval))
+    coarse_interval = configured_interval
+    if int(max_coarse_frames) > 0:
+        coarse_interval = max(
+            coarse_interval,
+            int(math.ceil(total_frames / max(1, int(max_coarse_frames)))),
+        )
+    target_coarse_fps = safe_fps / max(1, coarse_interval)
+    expected_coarse_frames = max(1, int(round(safe_duration * target_coarse_fps)))
+    coarse_seconds, coarse_scores, coarse_diag = _score_temporal_windows(
         opennsfw2,
         video_path,
-        frame_indices=coarse_frames,
+        windows=[(0.0, safe_duration)],
         fps=safe_fps,
+        duration_sec=safe_duration,
+        frame_interval=1,
+        aggregation_size=1,
         batch_size=batch_size,
         progress_bar=progress_bar,
-        clip_prefix="softcut_opennsfw2_coarse",
+        target_fps=target_coarse_fps,
+        clip_prefix="softcut_opennsfw2_coarse_window",
     )
     strategy_config: dict[str, Any] = {
         "coarse_interval": coarse_interval,
-        "coarse_global_frame_count": len(global_frames),
-        "coarse_scene_frame_count": len(scene_frames),
-        "coarse_total_frame_count": len(coarse_frames),
+        "coarse_global_frame_count": expected_coarse_frames,
+        "coarse_scene_frame_count": 0,
+        "coarse_total_frame_count": expected_coarse_frames,
+        "coarse_frame_count_capped": coarse_interval > configured_interval,
+        "max_coarse_frames": max(1, int(max_coarse_frames)),
+        "target_coarse_fps": round(target_coarse_fps, 6),
         "coarse_scored_frame_count": len(coarse_scores),
         "dense_window_count": 0,
         "dense_frame_count": 0,
         **{f"coarse_{key}": value for key, value in coarse_diag.items()},
     }
 
+    fallback_global_interval = False
     if not coarse_scores:
         elapsed_seconds, fallback_scores = _predict_video_scores(
             opennsfw2,
@@ -447,7 +782,75 @@ def _score_scene_aware_sparse(
         )
         strategy_config["coarse_clip_fallback"] = "global_interval"
         strategy_config["coarse_scored_frame_count"] = len(fallback_scores)
-        return normalized, fallback_scores, strategy_config
+        strategy_config["coarse_fallback_interval"] = coarse_interval
+        coarse_seconds = normalized
+        coarse_scores = fallback_scores
+        fallback_global_interval = True
+
+    if not coarse_scores:
+        return [], [], strategy_config
+    requested = max(1, int(strategy_config.get("coarse_total_frame_count", len(coarse_scores))))
+    strategy_config["coarse_score_coverage_ratio"] = round(
+        len(coarse_scores) / requested,
+        6,
+    )
+
+    # Add scene-representative micro-windows not already covered by coarse points.
+    if not fallback_global_interval and scene_segments:
+        rep_frames = _scene_representative_frame_indices(
+            scene_segments,
+            fps=safe_fps,
+            total_frames=total_frames,
+            per_scene_max_frames=max(1, int(per_scene_max_frames)),
+            boundary_cluster_sec=boundary_cluster_sec,
+            long_scene_stride_sec=long_scene_stride_sec,
+        )
+        coarse_hit_frames = {max(0, int(round(sec * safe_fps))) for sec in coarse_seconds}
+        coverage_tolerance = max(1, coarse_interval // 2)
+
+        def _is_covered(frame_index: int) -> bool:
+            return any(
+                (frame_index + delta) in coarse_hit_frames
+                for delta in range(-coverage_tolerance, coverage_tolerance + 1)
+            )
+
+        uncovered = [frame for frame in rep_frames if not _is_covered(frame)]
+        max_extra_windows = min(
+            max(8, int(max(1, int(max_coarse_frames)) // 5)),
+            48,
+        )
+        extra_windows = _windows_from_frame_indices(
+            uncovered,
+            fps=safe_fps,
+            radius_sec=max(0.08, float(boundary_cluster_sec) * 0.5),
+            duration_sec=safe_duration,
+            max_windows=max_extra_windows,
+        )
+        strategy_config["coarse_scene_frame_count"] = len(rep_frames)
+        strategy_config["coarse_uncovered_scene_frame_count"] = len(uncovered)
+        strategy_config["coarse_scene_window_count"] = len(extra_windows)
+        if extra_windows:
+            extra_seconds, extra_scores, extra_diag = _score_temporal_windows(
+                opennsfw2,
+                video_path,
+                windows=extra_windows,
+                fps=safe_fps,
+                duration_sec=safe_duration,
+                frame_interval=1,
+                aggregation_size=1,
+                batch_size=batch_size,
+                progress_bar=progress_bar,
+                target_fps=None,
+                clip_prefix="softcut_opennsfw2_scene_window",
+            )
+            strategy_config.update({f"coarse_scene_{key}": value for key, value in extra_diag.items()})
+            if extra_scores:
+                coarse_seconds, coarse_scores = _merge_points_by_frame(
+                    [*coarse_seconds, *extra_seconds],
+                    [*coarse_scores, *extra_scores],
+                    fps=safe_fps,
+                )
+                strategy_config["coarse_scored_frame_count"] = len(coarse_scores)
 
     suspicion_threshold = max(
         _clamp_probability(float(calibration_floor)),
@@ -464,32 +867,40 @@ def _score_scene_aware_sparse(
     strategy_config["suspicion_threshold"] = round(suspicion_threshold, 6)
     strategy_config["dense_window_count"] = len(dense_windows)
     strategy_config["dense_window_sec"] = round(max(0.1, float(dense_window_sec)), 6)
+    if int(max_dense_windows) <= 0:
+        strategy_config["dense_skipped_reason"] = "disabled_by_config"
+    if fallback_global_interval:
+        strategy_config["dense_skipped_reason"] = "coarse_fallback_global_interval"
 
     dense_seconds: list[float] = []
     dense_scores: list[float] = []
-    if dense_windows:
-        dense_frames = _frame_indices_from_windows(
-            dense_windows,
-            fps=safe_fps,
-            total_frames=total_frames,
-            frame_step=max(1, int(dense_frame_interval)),
-        )
-        strategy_config["dense_frame_count"] = len(dense_frames)
-        dense_seconds, dense_scores, dense_diag = _score_selected_frames(
+    if dense_windows and not fallback_global_interval:
+        dense_seconds, dense_scores, dense_diag = _score_temporal_windows(
             opennsfw2,
             video_path,
-            frame_indices=dense_frames,
+            windows=dense_windows,
             fps=safe_fps,
+            duration_sec=safe_duration,
+            frame_interval=max(1, int(dense_frame_interval)),
+            aggregation_size=1,
             batch_size=batch_size,
             progress_bar=progress_bar,
-            clip_prefix="softcut_opennsfw2_dense",
+            target_fps=None,
+            clip_prefix="softcut_opennsfw2_dense_window",
         )
+        strategy_config["dense_frame_count"] = int(dense_diag.get("requested_frame_count", 0) or 0)
         strategy_config["dense_scored_frame_count"] = len(dense_scores)
         strategy_config.update({f"dense_{key}": value for key, value in dense_diag.items()})
 
     merged_seconds, merged_scores = _merge_points_by_frame(
         [*coarse_seconds, *dense_seconds],
         [*coarse_scores, *dense_scores],
+        fps=safe_fps,
+    )
+    strategy_config["coverage_summary"] = _scene_sampling_coverage(
+        scene_segments=scene_segments,
+        sampled_seconds=merged_seconds,
+        dense_windows=dense_windows,
         fps=safe_fps,
     )
     strategy_config["merged_scored_frame_count"] = len(merged_scores)
@@ -625,6 +1036,7 @@ def score_full_video_in_process(
     merge_gap_sec: float = 1.0,
     max_flags_per_minute: float = 18.0,
     per_scene_max_frames: int = 4,
+    max_coarse_frames: int = 240,
     boundary_cluster_sec: float = 0.4,
     long_scene_stride_sec: float = 2.0,
     suspicious_score_ratio: float = 0.75,
@@ -659,6 +1071,7 @@ def score_full_video_in_process(
         "merge_gap_sec": merge_gap_sec,
         "max_flags_per_minute": max_flags_per_minute,
         "per_scene_max_frames": max(1, int(per_scene_max_frames)),
+        "max_coarse_frames": max(1, int(max_coarse_frames)),
         "boundary_cluster_sec": max(0.0, float(boundary_cluster_sec)),
         "long_scene_stride_sec": max(0.0, float(long_scene_stride_sec)),
         "suspicious_score_ratio": _clamp_probability(float(suspicious_score_ratio)),
@@ -707,6 +1120,7 @@ def score_full_video_in_process(
                 batch_size=max(1, int(batch_size)),
                 progress_bar=bool(progress_bar),
                 per_scene_max_frames=max(1, int(per_scene_max_frames)),
+                max_coarse_frames=max(1, int(max_coarse_frames)),
                 boundary_cluster_sec=max(0.0, float(boundary_cluster_sec)),
                 long_scene_stride_sec=max(0.0, float(long_scene_stride_sec)),
                 suspicious_score_ratio=_clamp_probability(float(suspicious_score_ratio)),
@@ -786,6 +1200,7 @@ def score_full_video(
     merge_gap_sec: float = 1.0,
     max_flags_per_minute: float = 18.0,
     per_scene_max_frames: int = 4,
+    max_coarse_frames: int = 240,
     boundary_cluster_sec: float = 0.4,
     long_scene_stride_sec: float = 2.0,
     suspicious_score_ratio: float = 0.75,
@@ -838,6 +1253,7 @@ def score_full_video(
         "merge_gap_sec": merge_gap_sec,
         "max_flags_per_minute": max_flags_per_minute,
         "per_scene_max_frames": max(1, int(per_scene_max_frames)),
+        "max_coarse_frames": max(1, int(max_coarse_frames)),
         "boundary_cluster_sec": max(0.0, float(boundary_cluster_sec)),
         "long_scene_stride_sec": max(0.0, float(long_scene_stride_sec)),
         "suspicious_score_ratio": _clamp_probability(float(suspicious_score_ratio)),
@@ -893,6 +1309,8 @@ def score_full_video(
         str(max_flags_per_minute),
         "--per-scene-max-frames",
         str(max(1, int(per_scene_max_frames))),
+        "--max-coarse-frames",
+        str(max(1, int(max_coarse_frames))),
         "--boundary-cluster-sec",
         str(max(0.0, float(boundary_cluster_sec))),
         "--long-scene-stride-sec",

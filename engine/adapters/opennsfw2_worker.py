@@ -26,6 +26,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--merge-gap-sec", type=float, default=1.0)
     parser.add_argument("--max-flags-per-minute", type=float, default=18.0)
     parser.add_argument("--per-scene-max-frames", type=int, default=4)
+    parser.add_argument("--max-coarse-frames", type=int, default=240)
     parser.add_argument("--boundary-cluster-sec", type=float, default=0.4)
     parser.add_argument("--long-scene-stride-sec", type=float, default=2.0)
     parser.add_argument("--suspicious-score-ratio", type=float, default=0.75)
@@ -60,6 +61,7 @@ def main() -> None:
         merge_gap_sec=float(args.merge_gap_sec),
         max_flags_per_minute=float(args.max_flags_per_minute),
         per_scene_max_frames=max(1, int(args.per_scene_max_frames)),
+        max_coarse_frames=max(1, int(args.max_coarse_frames)),
         boundary_cluster_sec=max(0.0, float(args.boundary_cluster_sec)),
         long_scene_stride_sec=max(0.0, float(args.long_scene_stride_sec)),
         suspicious_score_ratio=max(0.0, min(1.0, float(args.suspicious_score_ratio))),

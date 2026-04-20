@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 import shutil
 import time
 from pathlib import Path
@@ -76,6 +77,11 @@ VIOLENCE_PHRASES = {
     "kill": 0.62,
     "murder": 0.74,
     "shoot": 0.58,
+    "shot": 0.56,
+    "gun": 0.52,
+    "die": 0.62,
+    "dead": 0.58,
+    "suicide": 0.74,
     "blood": 0.52,
     "explode": 0.56,
 }
@@ -126,12 +132,13 @@ DEFAULT_ANALYSIS_CONFIG: dict[str, Any] = {
             "merge_gap_sec": 1.0,
             "max_flags_per_minute": 18.0,
             "per_scene_max_frames": 4,
+            "max_coarse_frames": 240,
             "boundary_cluster_sec": 0.4,
             "long_scene_stride_sec": 2.0,
             "suspicious_score_ratio": 0.75,
             "dense_window_sec": 1.5,
             "dense_frame_interval": 1,
-            "max_dense_windows": 16,
+            "max_dense_windows": 0,
         },
         "subtitle_bootstrap": {
             "enabled": False,
@@ -432,11 +439,19 @@ def _adapter_available_status() -> AdapterStatus:
 
 
 def _normalize_text_token(value: str) -> str:
-    cleaned = value.strip().lower().strip(".,!?\"'()[]{}")
+    cleaned = value.strip().lower().replace("’", "'")
+    cleaned = re.sub(r"^[^a-z0-9']+|[^a-z0-9']+$", "", cleaned)
+    if cleaned.endswith("'s") and len(cleaned) > 2:
+        cleaned = cleaned[:-2]
+    cleaned = cleaned.replace("'", "")
     if cleaned.endswith("ing") and len(cleaned) > 5:
         return cleaned[:-3]
     if cleaned.endswith("ed") and len(cleaned) > 4:
         return cleaned[:-2]
+    if cleaned.endswith("ies") and len(cleaned) > 4:
+        return cleaned[:-3] + "y"
+    if cleaned.endswith("s") and len(cleaned) > 4:
+        return cleaned[:-1]
     return cleaned
 
 
@@ -595,6 +610,76 @@ def _determine_visual_mode(opennsfw_status: AdapterStatus) -> str:
     return "full"
 
 
+def _build_visual_coverage_summary(
+    *,
+    visual_mode: str,
+    scene_count: int,
+    opennsfw_cfg: dict[str, Any],
+) -> dict[str, Any]:
+    total_scenes = max(0, int(scene_count))
+    dense_rescans = int(opennsfw_cfg.get("dense_window_count", 0) or 0)
+    summary = {
+        "total_scenes": total_scenes,
+        "sampled_scenes": 0,
+        "sampled_scene_ratio": 0.0,
+        "avg_frames_sampled_per_scene": 0.0,
+        "escalated_scenes": 0,
+        "escalated_scene_ratio": 0.0,
+        "dense_rescans": max(0, dense_rescans),
+    }
+    if visual_mode == "disabled":
+        return summary
+
+    adapter_summary = opennsfw_cfg.get("coverage_summary")
+    if isinstance(adapter_summary, dict):
+        sampled_scenes = int(adapter_summary.get("sampled_scenes", 0) or 0)
+        total_from_adapter = int(adapter_summary.get("total_scenes", total_scenes) or total_scenes)
+        total_scenes = max(total_scenes, total_from_adapter)
+        escalated_scenes = int(adapter_summary.get("escalated_scenes", 0) or 0)
+        dense_rescans = int(adapter_summary.get("dense_rescans", dense_rescans) or dense_rescans)
+        avg_frames = float(adapter_summary.get("avg_frames_sampled_per_scene", 0.0) or 0.0)
+        sampled_ratio = float(
+            adapter_summary.get(
+                "sampled_scene_ratio",
+                sampled_scenes / max(1, total_scenes),
+            )
+            or 0.0
+        )
+        escalated_ratio = float(
+            adapter_summary.get(
+                "escalated_scene_ratio",
+                escalated_scenes / max(1, total_scenes),
+            )
+            or 0.0
+        )
+        summary.update(
+            {
+                "total_scenes": total_scenes,
+                "sampled_scenes": max(0, min(total_scenes, sampled_scenes)),
+                "sampled_scene_ratio": round(max(0.0, min(1.0, sampled_ratio)), 6),
+                "avg_frames_sampled_per_scene": round(max(0.0, avg_frames), 6),
+                "escalated_scenes": max(0, min(total_scenes, escalated_scenes)),
+                "escalated_scene_ratio": round(max(0.0, min(1.0, escalated_ratio)), 6),
+                "dense_rescans": max(0, dense_rescans),
+            }
+        )
+        return summary
+
+    scanned_frames = int(opennsfw_cfg.get("scanned_frames", 0) or 0)
+    sampled_scenes = total_scenes if scanned_frames > 0 and total_scenes > 0 else 0
+    escalated_scenes = min(total_scenes, dense_rescans)
+    summary.update(
+        {
+            "sampled_scenes": sampled_scenes,
+            "sampled_scene_ratio": round(sampled_scenes / max(1, total_scenes), 6),
+            "avg_frames_sampled_per_scene": round(scanned_frames / max(1, total_scenes), 6),
+            "escalated_scenes": escalated_scenes,
+            "escalated_scene_ratio": round(escalated_scenes / max(1, total_scenes), 6),
+        }
+    )
+    return summary
+
+
 def _build_quality_report(
     *,
     job_id: str,
@@ -608,6 +693,7 @@ def _build_quality_report(
     transnet_status: AdapterStatus,
     opennsfw_status: AdapterStatus,
     quality_cfg: dict[str, Any],
+    coverage_summary: dict[str, Any] | None = None,
 ) -> AnalysisQualityReport:
     warnings: list[str] = []
     critical_findings: list[str] = []
@@ -638,8 +724,14 @@ def _build_quality_report(
         warnings.append("asr_degraded")
 
     visual_available = visual_mode != "disabled"
+    opennsfw_cfg = opennsfw_status.config if isinstance(opennsfw_status.config, dict) else {}
     if not visual_available:
         warnings.append("visual_disabled")
+    elif bool(opennsfw_cfg.get("coarse_clip_extract_failed")):
+        warnings.append("visual_sparse_extract_failed")
+        next_actions.append(
+            "Fix scene-aware sparse extraction; the run fell back to coarse global scan."
+        )
     elif int(opennsfw_status.config.get("visual_flag_count", 0) or 0) == 0:
         max_score = float(opennsfw_status.config.get("max_score", 0.0) or 0.0)
         warnings.append(f"visual_zero_flags_max_score={max_score:.3f}")
@@ -647,6 +739,35 @@ def _build_quality_report(
             "Inspect OpenNSFW2 score diagnostics; add a complementary visual adapter "
             "if the trailer risk is violence rather than nudity/sexual content."
         )
+    if visual_available:
+        coarse_total = int(opennsfw_cfg.get("coarse_total_frame_count", 0) or 0)
+        scanned_frames = int(opennsfw_cfg.get("scanned_frames", 0) or 0)
+        coarse_coverage = float(opennsfw_cfg.get("coarse_score_coverage_ratio", 1.0) or 0.0)
+        if coarse_total > 0 and coarse_coverage < 0.5:
+            warnings.append(f"visual_sparse_low_coverage_ratio={coarse_coverage:.3f}")
+            next_actions.append(
+                "Tune coarse sampling cap/interval to improve sparse visual coverage."
+            )
+        if coarse_total > 0 and scanned_frames > (coarse_total * 2):
+            warnings.append(f"visual_sparse_ineffective_scanned_frames={scanned_frames}")
+            next_actions.append(
+                "Investigate sparse visual fallback path; scanned-frame count is far above coarse target."
+            )
+        dense_window_count = int(opennsfw_cfg.get("dense_window_count", 0) or 0)
+        max_dense_windows = int(opennsfw_cfg.get("max_dense_windows", 0) or 0)
+        raw_hit_count = int(opennsfw_cfg.get("raw_hit_count", 0) or 0)
+        if (
+            max_dense_windows > 0
+            and
+            raw_hit_count > 0
+            and dense_window_count == 0
+            and not bool(opennsfw_cfg.get("coarse_clip_extract_failed"))
+            and not opennsfw_cfg.get("dense_skipped_reason")
+        ):
+            warnings.append("visual_dense_escalation_not_triggered")
+            next_actions.append(
+                "Verify suspicious-window densification triggers when coarse visual hits are present."
+            )
 
     planner_eligible = asr_mode != "failed" and (visual_available or run_profile != "strict")
     if run_profile == "strict":
@@ -654,6 +775,8 @@ def _build_quality_report(
             critical_findings.append("strict_requires_transnet")
         if bool(quality_cfg.get("strict_requires_visual", True)) and not visual_available:
             critical_findings.append("strict_requires_visual")
+        if bool(opennsfw_cfg.get("coarse_clip_extract_failed")):
+            critical_findings.append("visual_sparse_extract_failed")
         planner_eligible = planner_eligible and not critical_findings
 
     passed = planner_eligible and not critical_findings
@@ -664,6 +787,7 @@ def _build_quality_report(
         critical_findings=critical_findings,
         warnings=warnings,
         next_actions=next_actions,
+        coverage_summary=dict(coverage_summary or {}),
         planner_eligible=planner_eligible,
     )
 
@@ -1004,6 +1128,7 @@ def build_analysis_timeline(
         merge_gap_sec=float(opennsfw_cfg.get("merge_gap_sec", 1.0)),
         max_flags_per_minute=float(opennsfw_cfg.get("max_flags_per_minute", 18.0)),
         per_scene_max_frames=int(opennsfw_cfg.get("per_scene_max_frames", 4)),
+        max_coarse_frames=int(opennsfw_cfg.get("max_coarse_frames", 240)),
         boundary_cluster_sec=float(opennsfw_cfg.get("boundary_cluster_sec", 0.4)),
         long_scene_stride_sec=float(opennsfw_cfg.get("long_scene_stride_sec", 2.0)),
         suspicious_score_ratio=float(opennsfw_cfg.get("suspicious_score_ratio", 0.75)),
@@ -1057,6 +1182,12 @@ def build_analysis_timeline(
         openai_whisper_status=openai_whisper_status,
     )
     visual_mode = _determine_visual_mode(opennsfw_status)
+    opennsfw_cfg = opennsfw_status.config if isinstance(opennsfw_status.config, dict) else {}
+    coverage_summary = _build_visual_coverage_summary(
+        visual_mode=visual_mode,
+        scene_count=len(scenes),
+        opennsfw_cfg=opennsfw_cfg,
+    )
     detector_coverage = (
         sum(
             1
@@ -1088,8 +1219,29 @@ def build_analysis_timeline(
         quality_flags.append("single_detector_only")
     if visual_mode == "disabled":
         quality_flags.append("visual_mode_disabled")
+    elif bool(opennsfw_status.config.get("coarse_clip_extract_failed")):
+        quality_flags.append("visual_sparse_extract_failed")
     elif not visual_flags:
         quality_flags.append("visual_zero_flags")
+    coarse_total_frames = int(opennsfw_status.config.get("coarse_total_frame_count", 0) or 0)
+    scanned_frames = int(opennsfw_status.config.get("scanned_frames", 0) or 0)
+    coarse_coverage = float(opennsfw_status.config.get("coarse_score_coverage_ratio", 1.0) or 0.0)
+    if coarse_total_frames > 0 and coarse_coverage < 0.5:
+        quality_flags.append("visual_sparse_low_coverage")
+    if coarse_total_frames > 0 and scanned_frames > (coarse_total_frames * 2):
+        quality_flags.append("visual_sparse_ineffective")
+    dense_window_count = int(opennsfw_status.config.get("dense_window_count", 0) or 0)
+    max_dense_windows = int(opennsfw_status.config.get("max_dense_windows", 0) or 0)
+    raw_hit_count = int(opennsfw_status.config.get("raw_hit_count", 0) or 0)
+    if (
+        max_dense_windows > 0
+        and
+        raw_hit_count > 0
+        and dense_window_count == 0
+        and not bool(opennsfw_status.config.get("coarse_clip_extract_failed"))
+        and not opennsfw_status.config.get("dense_skipped_reason")
+    ):
+        quality_flags.append("visual_dense_escalation_not_triggered")
     if asr_mode != "full":
         quality_flags.append(f"asr_mode_{asr_mode}")
 
@@ -1114,6 +1266,7 @@ def build_analysis_timeline(
         transnet_status=transnet_status,
         opennsfw_status=opennsfw_status,
         quality_cfg=quality_cfg,
+        coverage_summary=coverage_summary,
     )
 
     metadata = AnalysisMetadata(
@@ -1155,6 +1308,7 @@ def build_analysis_timeline(
         asr_mode=asr_mode,
         visual_mode=visual_mode,
         quality_flags=quality_flags,
+        coverage_summary=coverage_summary,
         step_timings=step_timings,
         boundary_quality=boundary_quality,
         capability_matrix=preflight_capabilities,
