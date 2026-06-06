@@ -6,6 +6,16 @@
   "scripts": {
     "analysis": "sh scripts/run-analysis-config.sh --config configs/project.yaml",
     "analysis:config": "sh scripts/run-analysis-config.sh",
-    "install:frozen": "pnpm install --frozen-lockfile"
+    "planner": "sh scripts/run-plan-config.sh --config configs/project.yaml",
+    "planner:config": "sh scripts/run-plan-config.sh",
+    "web:dev": "pnpm --filter @softcut/web dev",
+    "web:build": "pnpm --filter @softcut/web build",
+    "web:test": "pnpm --filter @softcut/web test",
+    "install:frozen": "pnpm install --frozen-lockfile",
+    "api": "./run api"
+  },
+  "dependencies": {
+    "@supabase/ssr": "^0.10.2",
+    "@supabase/supabase-js": "^2.103.3"
   }
 }

@@ -10,6 +10,9 @@ print_help() {
   printf '%s\n' "Tasks:"
   printf '%s\n' "  analysis        Run config-driven analysis (configs/project.yaml)"
   printf '%s\n' "  analysis-cli    Run analysis CLI directly (pass --input/--url/--url-file etc.)"
+  printf '%s\n' "  planner         Run config-driven planner (configs/project.yaml)"
+  printf '%s\n' "  planner-cli     Run planner CLI directly (pass --timeline/--quality-report etc.)"
+  printf '%s\n' "  web             Run Next.js web UI (apps/web)"
   printf '%s\n' "  adapters        Install optional free ML adapters (OpenNSFW2 runtime + TransNetV2)"
   printf '%s\n' "  api             Run local FastAPI server"
   printf '%s\n' "  install         Run Node install helper (frozen lockfile when available)"
@@ -28,6 +31,15 @@ case "$task" in
     ;;
   analysis-cli)
     exec sh scripts/run-analysis.sh "$@"
+    ;;
+  planner)
+    exec sh scripts/run-plan-config.sh --config configs/project.yaml "$@"
+    ;;
+  planner-cli)
+    exec sh scripts/run-plan.sh "$@"
+    ;;
+  web)
+    exec pnpm --filter @softcut/web dev "$@"
     ;;
   adapters)
     exec sh scripts/install-optional-adapters.sh "$@"

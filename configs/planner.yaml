@@ -1,0 +1,27 @@
+planner:
+  # Require analysis quality gate to mark planner_eligible=true by default.
+  require_planner_eligible: true
+  # Drop weak evidence before generating edit actions.
+  min_evidence_score: 0.3
+  # Cap action count to keep downstream execution predictable for MVP.
+  max_actions: 200
+  # Keep scene deletion disabled by default; prefer targeted trims/mutes.
+  allow_remove_scene: false
+
+  action_by_evidence_type:
+    strong_profanity: beep_word
+    moderate_profanity: mute_word
+    violent_dialogue: trim_segment
+    nsfw_visual: trim_segment
+
+  action_fallback_order:
+    - trim_segment
+    - mute_word
+    - beep_word
+    - remove_scene
+
+  # Escalate high-confidence profanity to beep instead of full-window mute.
+  profanity_beep_threshold: 0.85
+  mute_padding_sec: 0.05
+  beep_padding_sec: 0.03
+  min_trim_duration_sec: 0.2

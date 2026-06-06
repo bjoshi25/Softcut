@@ -86,15 +86,19 @@ sh scripts/check-env.sh
 
 Both scripts are non-destructive and avoid installing dependencies.
 
-## Softcut MVP (Phase 1 Step 1)
+## Softcut MVP (Phase 1 Steps 1-2)
 
-This repository now contains a runnable fused analysis engine for local videos.
+This repository now contains:
+- Phase 1 Step 1: fused analysis engine for local videos.
+- Phase 1 Step 2: deterministic planner that converts analysis artifacts into edit actions.
 
 Core flow:
 
 ```text
 data/inbox/input.mp4
 -> artifacts/{job_id}/analysis_timeline.json
+-> artifacts/{job_id}/edit_plan.json
+-> apps/web results view
 ```
 
 ### Two-word run commands
@@ -141,6 +145,20 @@ This now writes two artifacts:
 - `artifacts/<job_id>/analysis_timeline.json`
 - `artifacts/<job_id>/analysis_quality_report.json`
 
+6) Run planner:
+
+```sh
+./run planner
+```
+
+This writes:
+- `artifacts/<job_id>/edit_plan.json`
+
+Planner defaults:
+- requires `analysis_quality_report.planner_eligible=true`
+- maps evidence types to deterministic actions (`beep_word`, `mute_word`, `trim_segment`)
+- uses safe cut anchors when generating trim windows
+
 Visual analysis defaults to a scene-aware sparse strategy: coarse global
 sampling plus representative scene frames, then dense local rescans only around
 suspicious windows. The resulting hits are calibrated from score distribution
@@ -164,6 +182,32 @@ API:
 ```sh
 ./run api
 ```
+
+Web UI:
+
+```sh
+./run web
+```
+
+Default UI URL: `http://localhost:3000`  
+Default API target: `NEXT_PUBLIC_API_BASE=http://localhost:8000`
+
+Create a local planner job:
+
+```sh
+curl -X POST http://localhost:8000/planner/jobs/local \
+  -H "Content-Type: application/json" \
+  -d '{
+    "job_id": "local_001"
+  }'
+```
+
+Async orchestration endpoints for UI:
+- `POST /jobs/from-upload`
+- `POST /jobs/from-url`
+- `POST /jobs/{job_id}/planner`
+- `GET /jobs/{job_id}`
+- `GET /jobs/{job_id}/results`
 
 Status (second two-word command):
 
@@ -208,3 +252,27 @@ curl -X POST http://localhost:8000/analysis/jobs/local \
     "job_id": "local_001"
   }'
 ```
+
+Direct planner CLI:
+
+```sh
+./run planner-cli \
+  --timeline artifacts/local_from_config_001/analysis_timeline.json \
+  --quality-report artifacts/local_from_config_001/analysis_quality_report.json \
+  --output artifacts/local_from_config_001/edit_plan.json
+```
+## Supabase Job Persistence
+
+The async `/jobs/*` API supports Supabase-backed persistence when these backend env vars are set:
+
+- `SUPABASE_URL`
+- `SUPABASE_SERVICE_ROLE_KEY`
+
+Create the required table by running SQL from:
+
+- `supabase/sql/jobs_table.sql`
+
+Frontend Supabase client env vars (Next.js):
+
+- `NEXT_PUBLIC_SUPABASE_URL`
+- `NEXT_PUBLIC_SUPABASE_ANON_KEY`

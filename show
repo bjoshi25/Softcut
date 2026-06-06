@@ -115,6 +115,37 @@ print(f"quality_status: passed={str(passed).lower()} planner_eligible={str(plann
 PY
 }
 
+print_plan_status() {
+  plan_file=$1
+  if [ ! -f "$plan_file" ]; then
+    printf '%s\n' "edit_plan: missing"
+    return
+  fi
+  if ! command -v python3 >/dev/null 2>&1; then
+    printf '%s\n' "edit_plan: present (python3 not found for summary)"
+    return
+  fi
+  python3 - "$plan_file" <<'PY'
+import json
+import sys
+path = sys.argv[1]
+try:
+    data = json.load(open(path, "r", encoding="utf-8"))
+except Exception as exc:
+    print(f"edit_plan: unreadable ({exc.__class__.__name__})")
+    raise SystemExit(0)
+summary = data.get("summary") or {}
+actions = data.get("actions") or []
+print(f"edit_plan: {path}")
+print(
+  "plan_status: "
+  f"actions={len(actions)} "
+  f"candidate_windows={summary.get('candidate_windows', 0)} "
+  f"dropped_low_score={summary.get('dropped_low_score', 0)}"
+)
+PY
+}
+
 show_status() {
   printf '%s\n' "Softcut Status"
   printf '%s\n' "-------------"
@@ -183,6 +214,7 @@ show_status() {
       printf '%s\n' "analysis_timeline: $timeline_path"
       print_asr_status "$timeline_path"
       print_quality_status "$artifacts_root/$job_id/analysis_quality_report.json"
+      print_plan_status "$artifacts_root/$job_id/edit_plan.json"
     else
       printf '%s\n' "analysis_timeline: missing for job_id=$job_id"
     fi

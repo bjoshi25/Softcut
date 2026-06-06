@@ -24,3 +24,17 @@ analysis_run:
     prune_other_artifacts: null
     keep_artifact_jobs: null
     analysis_config_path: configs/analysis.yaml
+
+planner_run:
+  # Defaults to analysis_run.job_id when omitted.
+  job_id: local_from_config_001
+
+  paths:
+    artifacts_root: artifacts
+
+  settings:
+    # Optional explicit overrides:
+    # timeline_path: artifacts/local_from_config_001/analysis_timeline.json
+    # quality_report_path: artifacts/local_from_config_001/analysis_quality_report.json
+    output_name: edit_plan.json
+    planner_config_path: configs/planner.yaml

@@ -10,6 +10,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
   "fastapi>=0.115,<1",
+  "python-multipart>=0.0.9,<1",
   "pydantic>=2.8,<3",
   "PyYAML>=6,<7",
   "uvicorn>=0.30,<1",
@@ -32,6 +33,7 @@ ingest = [
 
 [project.scripts]
 softcut-build-timeline = "engine.analysis.build_timeline:main"
+softcut-build-plan = "engine.planning.build_plan:main"
 
 [tool.setuptools]
 include-package-data = true
