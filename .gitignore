@@ -11,6 +11,8 @@ Thumbs.db
 # Node workspace files
 node_modules/
 .nx/
+apps/web/.next/
+.next/
 
 # Local environment files
 .env
